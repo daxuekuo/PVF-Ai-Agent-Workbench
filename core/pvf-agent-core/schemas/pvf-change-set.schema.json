@@ -84,6 +84,9 @@
           },
           {
             "$ref": "#/$defs/writeFileChange"
+          },
+          {
+            "$ref": "#/$defs/copyFileChange"
           }
         ]
       }
@@ -318,14 +321,80 @@
         }
       }
     },
+    "copyFileChange": {
+      "type": "object",
+      "required": [
+        "id",
+        "type",
+        "pvfPath",
+        "sourcePvfPath",
+        "expectAbsent"
+      ],
+      "additionalProperties": false,
+      "description": "Copy one complete ordinary text file from the same source PVF to a new path. Protected high-risk extensions are rejected, and modifications to the clone must use a cumulative next round.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "type": {
+          "const": "copy-file"
+        },
+        "pvfPath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourcePvfPath": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expectAbsent": {
+          "const": true
+        },
+        "compileScript": {
+          "type": "boolean",
+          "default": true
+        },
+        "pvfEncoding": {
+          "enum": [
+            "Tw",
+            "Cn",
+            "Kr",
+            "Jp",
+            "Utf8",
+            "Unicode"
+          ]
+        },
+        "rationale": {
+          "type": "string"
+        },
+        "requiredResolvedIds": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "lstPath",
+              "id",
+              "expectedPvfPath"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "lstPath": { "type": "string" },
+              "id": { "type": "integer" },
+              "expectedPvfPath": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
     "writeProof": {
       "type": "object",
       "required": ["mode"],
       "additionalProperties": false,
-      "description": "受控高风险新增文件或登记表生命周期证据。工作台会在目标 PVF 内重新检查，不能只凭声明放行。",
+      "description": "受控高风险新增文件、登记表生命周期或既有 NUT 专用修改证据。工作台会在目标 PVF 内重新检查，不能只凭声明放行。",
       "properties": {
         "mode": {
-          "enum": ["worldmap-lifecycle", "registry-lifecycle", "script-new-file", "localization-new-file"]
+          "enum": ["worldmap-lifecycle", "registry-lifecycle", "script-new-file", "localization-new-file", "existing-nut-controlled-edit"]
         },
         "allowExistingRegistryEdit": { "type": "boolean" },
         "registry": {
@@ -362,6 +431,57 @@
         "encodingRoundTripRequired": { "type": "boolean" },
         "pvfEncoding": { "enum": ["Cn", "Tw", "Kr", "Jp", "Utf8", "Unicode"] },
         "sourceTextSha256": { "type": "string", "pattern": "^[A-Fa-f0-9]{64}$" },
+        "structureCheckRequired": { "type": "boolean" },
+        "temporaryRoundTripRequired": { "type": "boolean" },
+        "runtimeValidationRequired": { "type": "boolean" },
+        "loadChain": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["fromPvfPath", "toPvfPath", "requiredText"],
+            "properties": {
+              "fromPvfPath": { "type": "string", "minLength": 1 },
+              "toPvfPath": { "type": "string", "minLength": 1 },
+              "requiredText": { "type": "string", "minLength": 1 }
+            }
+          }
+        },
+        "touchedFunctions": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.:]*$" }
+        },
+        "apiSymbols": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "kind", "targetEvidencePaths"],
+            "properties": {
+              "name": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_.:]*$" },
+              "kind": { "enum": ["function", "constant"] },
+              "targetEvidencePaths": {
+                "type": "array",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "apidPlan": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["namespace", "ids", "conflictSearchRequired"],
+          "properties": {
+            "namespace": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
+            "ids": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 1, "maximum": 2147483647 }
+            },
+            "conflictSearchRequired": { "const": true }
+          }
+        },
         "crossVersionEvidence": {
           "type": "array",
           "items": {
@@ -376,6 +496,26 @@
         }
       },
       "allOf": [
+        {
+          "if": { "properties": { "mode": { "const": "existing-nut-controlled-edit" } }, "required": ["mode"] },
+          "then": {
+            "required": ["sourceTextSha256", "structureCheckRequired", "temporaryRoundTripRequired", "runtimeValidationRequired", "loadChain", "touchedFunctions", "apiSymbols", "apidPlan"],
+            "properties": {
+              "structureCheckRequired": { "const": true },
+              "temporaryRoundTripRequired": { "const": true },
+              "runtimeValidationRequired": { "const": true },
+              "loadChain": { "minItems": 2 },
+              "touchedFunctions": { "minItems": 1, "uniqueItems": true },
+              "apiSymbols": { "minItems": 1, "uniqueItems": true },
+              "apidPlan": {
+                "properties": {
+                  "ids": { "uniqueItems": true },
+                  "conflictSearchRequired": { "const": true }
+                }
+              }
+            }
+          }
+        },
         {
           "if": { "properties": { "mode": { "const": "script-new-file" } }, "required": ["mode"] },
           "then": {

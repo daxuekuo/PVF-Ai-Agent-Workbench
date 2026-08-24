@@ -29,6 +29,9 @@ workbench.bat pvf-change dry-run --file "D:\MyDNFWork\changes\round-1.json" --pv
 rem 从上一条 JSON 输出中复制 manifestPath 和 approvalCode；下面的 --out 是独立成品目录
 workbench.bat pvf-change apply --file "D:\MyDNFWork\changes\round-1.json" --pvf "D:\MyDNFWork\Script.pvf" --dry-run-manifest "D:\MyDNFWork\pvf-lab\round-1-preview\DRY-RUN-MANIFEST.json" --authorize-apply <approvalCode> --out "D:\MyDNFWork\pvf-lab\round-1-output"
 rem 生成后会自动重新检查；需要人工复核具体字段时，再对 APPLY-MANIFEST.json 返回的 outputPvf 执行 pvf-read read --raw
+rem 若已单独授权实机测试，直接跟随 apply 返回的 agentHandoff；即使最初来源就是客户端 Script.pvf，也由工作台核对受保护备份后自动部署，不要手工复制
+workbench.bat client-pvf preview --profile main-local --apply-manifest "D:\MyDNFWork\pvf-lab\round-1-output\APPLY-MANIFEST.json"
+workbench.bat client-pvf deploy --preview-manifest "<CLIENT-PVF-DEPLOY-PREVIEW.json>" --authorize-deploy <approvalCode> --confirm-client-closed
 workbench.bat absorb new --id KV-XX --title "Runtime validation" --domain itemshop --status PASS
 ```
 
@@ -42,11 +45,11 @@ workbench.bat absorb new --id KV-XX --title "Runtime validation" --domain itemsh
 
 只要任务是按自然语言寻找实体，即使同时出现地图号、层号或猜测 ID，也必须先用 `SearchName`；只有用户明确给出数字 ID/登记路径作为选择器时才可先 `resolve-lst`/`resolve-path`。
 
-纯数字/英文的完整原始 token 参数路线已覆盖 `.cre`、`.npc`、`.msn`、`.wdm`、`.twn`、`.rgn` 和 `.mm`。既有 `.co`、`.lst`、NUT、`.sqr`、`.str` 仍受保护；新增这些高风险文件只能提交匹配的 `writeProof`，通过格式/登记冲突、脚本结构、临时写出或编码往返和独立读回。新增 `.wdm` 还必须把 worldmap registry、UI、dungeon、town/region 入口作为一个原子闭合组审阅。这不替代客户端资源或实机验证。
+纯数字/英文的完整原始 token 参数路线已覆盖 `.cre`、`.npc`、`.msn`、`.wdm`、`.twn`、`.rgn` 和 `.mm`。既有 `.co`、`.lst`、NUT、`.sqr`、`.str` 仍受保护；新增这些高风险文件只能提交匹配的 `writeProof`。既有 `sqr/*.nut` 另有 `existing-nut-controlled-edit` ASCII 专用路线，绑定完整原文 SHA256、目标路径作为函数调用参数的预先存在 load_state/passive/appendage 链、目标 API 证据、函数/APID 审计、临时独立 PVF 往返与最终独立文本/原始字节 SHA256 读回；写入只替换唯一定位的原始 ASCII 字节区间，不重编码整份 NUT，并逐段证明其余字节不变，因此可原样保留不可还原的 Cn/Tw 旧字节。它不替代实机验证，也不开放中文、StringLink 或其他既有高风险类型。新增 `.wdm` 还必须把 worldmap registry、UI、dungeon、town/region 入口作为一个原子闭合组审阅。
 
 直接给出 `--pvf` 时不需要先检查或创建 profile。本机 profile 写入工作台外的 `PVF-Agent-Workbench-State/profiles/<workbench-id>/`。
 
-下一轮只写本轮差异时，change-set 保持 `target.sourcePvf` 为最初受保护源，并增加：
+下一轮只写本轮差异时，change-set 保持 `target.sourcePvf` 为最初来源（即使该路径现在是已部署版本，核验记录也会自动解析到内容寻址的受保护锚点），并增加：
 
 ```json
 "baseline": {

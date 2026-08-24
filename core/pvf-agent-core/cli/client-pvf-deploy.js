@@ -42,7 +42,7 @@ function usage() {
     "  workbench.bat client-pvf self-test [--out <dir>]",
     "",
     "This lane only installs a verified output Script.pvf into the client root recorded by a local profile.",
-    "It never writes NPK, IMG, UI, or another client resource, and it never overwrites the source PVF.",
+    "It never writes NPK, IMG, UI, or another client resource. A live client-origin source path is replaceable only after its verified backup becomes the protected anchor.",
     "",
   ].join("\n");
 }
@@ -77,6 +77,13 @@ function sha256Json(value) {
 
 function isSha256(value) {
   return /^[a-f0-9]{64}$/i.test(String(value || ""));
+}
+
+function isContentAddressedPvfBackup(file, expectedSha256) {
+  return (
+    path.basename(path.dirname(file)).toLowerCase() === "sha256" &&
+    path.basename(file).toLowerCase() === `${String(expectedSha256).toLowerCase()}.script.pvf`
+  );
 }
 
 function assertCondition(condition, message, code) {
@@ -158,6 +165,10 @@ function loadPolicy() {
   assertCondition(policy.permissionModel?.profileClientRootRequired === true, "A profile client root must be required.");
   assertCondition(policy.permissionModel?.directClientPathAllowed === false, "Direct unprofiled client paths must remain blocked.");
   assertCondition(policy.permissionModel?.sourcePvfOverwriteAllowed === false, "Source PVF overwrite must remain blocked.");
+  assertCondition(
+    policy.permissionModel?.clientOriginSourcePromotionAllowed === true,
+    "A client-origin source may be replaced only after promotion to a verified protected backup anchor.",
+  );
   assertCondition(policy.permissionModel?.applyOutputMutationAllowed === false, "Apply output mutation must remain blocked.");
   assertCondition(
     policy.permissionModel?.nonPvfClientResourceWriteAllowed === false,
@@ -168,10 +179,18 @@ function loadPolicy() {
     deployGates.has("current-client-matches-apply-input-or-explicit-baseline-switch"),
     "Client deployment policy must require apply-input baseline continuity.",
   );
+  assertCondition(
+    deployGates.has("verified-protected-source-anchor-before-client-origin-replacement"),
+    "Client deployment policy must require a protected backup anchor before replacing a client-origin source.",
+  );
   const forbidden = new Set(policy.forbiddenOperations || []);
   assertCondition(
     forbidden.has("deploy-over-divergent-baseline-without-explicit-switch"),
     "Client deployment policy must block an undeclared baseline switch.",
+  );
+  assertCondition(
+    forbidden.has("deploy-over-unanchored-source-pvf"),
+    "Client deployment policy must block replacement of an unanchored source PVF.",
   );
   return policy;
 }
@@ -283,26 +302,53 @@ function validateApplyManifest(manifestFile) {
 
   const outputPvf = assertRegularFile(manifest.outputPvf, "Apply output PVF");
   const sourcePvf = assertRegularFile(manifest.sourcePvf, "Apply input PVF");
-  const protectedSourcePvf = assertRegularFile(manifest.protectedSourcePvf || manifest.sourcePvf, "Apply protected source PVF");
-  assertCondition(sourcePvf && !samePath(sourcePvf, outputPvf), "Apply output must remain separate from the input PVF.");
-  assertCondition(!samePath(protectedSourcePvf, outputPvf), "Apply output must remain separate from the protected source PVF.");
-  const sourceInfo = fileInfo(sourcePvf);
-  const protectedSourceInfo = fileInfo(protectedSourcePvf);
-  assertCondition(isSha256(manifest.sourcePvfSha256), "Apply manifest sourcePvfSha256 is missing or invalid.");
-  assertCondition(
-    sourceInfo.sha256.toLowerCase() === String(manifest.sourcePvfSha256).toLowerCase(),
-    "Apply source PVF changed after its output was generated. Regenerate the output and deployment preview.",
-    "APPLY_SOURCE_CHANGED",
+  const declaredProtectedSourcePvf = assertRegularFile(
+    manifest.protectedSourcePvf || manifest.sourcePvf,
+    "Apply protected source PVF",
   );
+  assertCondition(sourcePvf && !samePath(sourcePvf, outputPvf), "Apply output must remain separate from the input PVF.");
+  const sourceInfo = fileInfo(sourcePvf);
+  const declaredProtectedSourceInfo = fileInfo(declaredProtectedSourcePvf);
+  assertCondition(isSha256(manifest.sourcePvfSha256), "Apply manifest sourcePvfSha256 is missing or invalid.");
+  const expectedSourceSha256 = String(manifest.sourcePvfSha256).toLowerCase();
+  const sourcePvfUnchanged = sourceInfo.sha256.toLowerCase() === expectedSourceSha256;
   const expectedProtectedSourceSha256 = manifest.protectedSourcePvfSha256 || manifest.sourcePvfSha256;
   assertCondition(isSha256(expectedProtectedSourceSha256), "Apply manifest protectedSourcePvfSha256 is missing or invalid.");
+  const normalizedProtectedSourceSha256 = String(expectedProtectedSourceSha256).toLowerCase();
+
+  let protectedSourceInfo = declaredProtectedSourceInfo;
+  let protectedSourceAnchorPromoted = false;
+  const verifiedBackupEvidence =
+    manifest.backupPath &&
+    manifest.safety?.backupCreated === true &&
+    manifest.safety?.backupContentAddressed === true &&
+    manifest.safety?.backupSha256Verified === true;
+  if (verifiedBackupEvidence) {
+    const backupPvf = assertRegularFile(manifest.backupPath, "Apply protected-source backup");
+    assertOutsideWorkbench(backupPvf, "Apply protected-source backup");
+    assertCondition(
+      isContentAddressedPvfBackup(backupPvf, normalizedProtectedSourceSha256),
+      "Apply protected-source backup path is not content-addressed by its verified SHA256.",
+      "APPLY_PROTECTED_SOURCE_BACKUP_PATH_INVALID",
+    );
+    const backupInfo = fileInfo(backupPvf);
+    assertCondition(
+      backupInfo.sha256.toLowerCase() === normalizedProtectedSourceSha256,
+      "Apply protected-source backup SHA256 no longer matches its manifest.",
+      "APPLY_PROTECTED_SOURCE_BACKUP_CHANGED",
+    );
+    protectedSourceInfo = backupInfo;
+    protectedSourceAnchorPromoted = !samePath(backupInfo.path, declaredProtectedSourceInfo.path);
+  }
   assertCondition(
-    protectedSourceInfo.sha256.toLowerCase() === String(expectedProtectedSourceSha256).toLowerCase(),
-    "Apply protected source PVF changed after its output was generated.",
+    protectedSourceInfo.sha256.toLowerCase() === normalizedProtectedSourceSha256,
+    "Apply protected source PVF changed and no verified content-addressed backup can preserve it.",
     "APPLY_PROTECTED_SOURCE_CHANGED",
   );
+  assertCondition(!samePath(protectedSourceInfo.path, outputPvf), "Apply output must remain separate from the protected source anchor.");
   assertOutsideWorkbench(outputPvf, "Apply output PVF");
   assertOutsideWorkbench(sourcePvf, "Apply source PVF");
+  assertOutsideWorkbench(protectedSourceInfo.path, "Apply protected source anchor");
   assertCondition(isSha256(manifest.outputPvfSha256), "Apply manifest outputPvfSha256 is missing or invalid.");
   const outputInfo = fileInfo(outputPvf);
   assertCondition(
@@ -315,6 +361,12 @@ function validateApplyManifest(manifestFile) {
     "Apply output PVF size no longer matches its manifest.",
     "APPLY_OUTPUT_CHANGED",
   );
+  const protectedSourceOriginPvf = path.resolve(
+    manifest.protectedSourceOriginPvf ||
+      manifest.cumulative?.protectedSourceOriginPvf ||
+      declaredProtectedSourceInfo.path,
+  );
+  protectedSourceAnchorPromoted = !samePath(protectedSourceInfo.path, protectedSourceOriginPvf);
 
   return {
     manifestPath,
@@ -322,15 +374,33 @@ function validateApplyManifest(manifestFile) {
     manifest,
     sourcePvf: sourceInfo.path,
     sourcePvfRealPath: sourceInfo.realPath,
-    sourcePvfSha256: sourceInfo.sha256,
+    sourcePvfSha256: expectedSourceSha256,
+    sourcePvfCurrentSha256: sourceInfo.sha256,
+    sourcePvfUnchanged,
     protectedSourcePvf: protectedSourceInfo.path,
     protectedSourcePvfRealPath: protectedSourceInfo.realPath,
     protectedSourcePvfSha256: protectedSourceInfo.sha256,
+    protectedSourceOriginPvf,
+    protectedSourceOriginPvfRealPath: prospectiveRealPath(protectedSourceOriginPvf),
+    protectedSourceAnchorPromoted,
+    verifiedProtectedSourceBackup: verifiedBackupEvidence === true,
     outputPvf: outputInfo.path,
     outputPvfRealPath: outputInfo.realPath,
     outputPvfSha256: outputInfo.sha256,
     outputPvfBytes: outputInfo.bytes,
   };
+}
+
+function profileMatchesApplyProtectedSource(profile, apply) {
+  if (typeof profile?.sourcePvf !== "string" || !profile.sourcePvf.trim()) return false;
+  const profileSourcePvf = path.resolve(profile.sourcePvf);
+  const profileSourcePvfRealPath = prospectiveRealPath(profileSourcePvf);
+  return (
+    samePath(profileSourcePvf, apply.protectedSourcePvf) ||
+    samePath(profileSourcePvfRealPath, apply.protectedSourcePvfRealPath) ||
+    samePath(profileSourcePvf, apply.protectedSourceOriginPvf) ||
+    samePath(profileSourcePvfRealPath, apply.protectedSourceOriginPvfRealPath)
+  );
 }
 
 function backupPathFor(clientContext, clientSha256, policy) {
@@ -349,6 +419,22 @@ function backupPathFor(clientContext, clientSha256, policy) {
   );
   assertOutsideWorkbench(backupPath, "Client PVF backup");
   return backupPath;
+}
+
+function deployBackupPlan(clientContext, apply, policy, protectedSourceOriginIsClientTarget) {
+  const anchorInsideProfileOutput =
+    pathInside(clientContext.profileOutput, apply.protectedSourcePvf) &&
+    pathInside(clientContext.profileOutputRealPath, apply.protectedSourcePvfRealPath);
+  const canReuseProtectedSourceAnchor =
+    protectedSourceOriginIsClientTarget === true &&
+    anchorInsideProfileOutput &&
+    clientContext.clientPvfSha256.toLowerCase() === apply.protectedSourcePvfSha256.toLowerCase();
+  return {
+    path: canReuseProtectedSourceAnchor
+      ? apply.protectedSourcePvf
+      : backupPathFor(clientContext, clientContext.clientPvfSha256, policy),
+    reusesProtectedSourceAnchor: canReuseProtectedSourceAnchor,
+  };
 }
 
 function makeBinding(prefix, inputs) {
@@ -398,10 +484,18 @@ function createDeployPreview(options) {
   const applyInputIsClientTarget =
     samePath(client.clientPvf, apply.sourcePvf) ||
     samePath(client.clientPvfRealPath, apply.sourcePvfRealPath);
+  const protectedSourceOriginIsClientTarget =
+    samePath(client.clientPvf, apply.protectedSourceOriginPvf) ||
+    samePath(client.clientPvfRealPath, apply.protectedSourceOriginPvfRealPath);
+  assertCondition(
+    apply.sourcePvfUnchanged || applyInputIsClientTarget,
+    "Apply source PVF changed after its output was generated. Regenerate the output and deployment preview.",
+    "APPLY_SOURCE_CHANGED",
+  );
   assertCondition(
     !samePath(client.clientPvf, apply.protectedSourcePvf) &&
       !samePath(client.clientPvfRealPath, apply.protectedSourcePvfRealPath),
-    "The client Script.pvf is also the protected source PVF. Keep the protected source outside the test client.",
+    "The client Script.pvf is still the protected source anchor. A verified content-addressed source backup is required before in-place testing.",
     "SOURCE_CLIENT_COLLISION",
   );
   assertCondition(
@@ -416,10 +510,8 @@ function createDeployPreview(options) {
     "OUTPUT_INSIDE_CLIENT",
   );
   assertCondition(
-    typeof profile.sourcePvf === "string" &&
-      (samePath(profile.sourcePvf, apply.protectedSourcePvf) ||
-        samePath(prospectiveRealPath(profile.sourcePvf), apply.protectedSourcePvfRealPath)),
-    "The deployment profile sourcePvf does not match the protected source recorded by the apply manifest.",
+    profileMatchesApplyProtectedSource(profile, apply),
+    "The deployment profile sourcePvf does not match either the protected source anchor or its recorded client-origin path.",
     "PROFILE_APPLY_SOURCE_MISMATCH",
   );
   const cumulativeInputExpected = apply.manifest.cumulative?.enabled === true
@@ -453,7 +545,8 @@ function createDeployPreview(options) {
   assertCondition(!fs.existsSync(deploymentManifestPath), "Refusing to reuse a deployment run that already has a manifest: " + deploymentManifestPath);
 
   const noChange = client.clientPvfSha256.toLowerCase() === apply.outputPvfSha256.toLowerCase();
-  const backupPath = backupPathFor(client, client.clientPvfSha256, policy);
+  const backupPlan = deployBackupPlan(client, apply, policy, protectedSourceOriginIsClientTarget);
+  const backupPath = backupPlan.path;
   const bindingInputs = {
     schemaVersion: "1.0",
     operation: "deploy-client-script-pvf",
@@ -464,6 +557,10 @@ function createDeployPreview(options) {
     sourcePvfSha256: apply.sourcePvfSha256,
     protectedSourcePvf: apply.protectedSourcePvf,
     protectedSourcePvfSha256: apply.protectedSourcePvfSha256,
+    protectedSourceOriginPvf: apply.protectedSourceOriginPvf,
+    protectedSourceOriginIsClientTarget,
+    protectedSourceAnchorPromoted: apply.protectedSourceAnchorPromoted,
+    clientBackupReusesProtectedSourceAnchor: backupPlan.reusesProtectedSourceAnchor,
     outputPvf: apply.outputPvf,
     outputPvfSha256: apply.outputPvfSha256,
     outputPvfBytes: apply.outputPvfBytes,
@@ -505,6 +602,9 @@ function createDeployPreview(options) {
     baselineContinuityOk,
     baselineSwitchConfirmed,
     applyInputIsClientTarget,
+    protectedSourceOriginIsClientTarget,
+    protectedSourceAnchorPromoted: apply.protectedSourceAnchorPromoted,
+    clientBackupReusesProtectedSourceAnchor: backupPlan.reusesProtectedSourceAnchor,
     binding,
     safety: {
       writeOperationsExecuted: false,
@@ -519,6 +619,9 @@ function createDeployPreview(options) {
       explicitBaselineSwitchConfirmed: baselineSwitchConfirmed,
       sourceClientPathsDistinct: !applyInputIsClientTarget,
       protectedSourceClientPathsDistinct: true,
+      clientOriginSourceProtectedByVerifiedBackup:
+        protectedSourceOriginIsClientTarget && apply.verifiedProtectedSourceBackup,
+      clientBackupReusesProtectedSourceAnchor: backupPlan.reusesProtectedSourceAnchor,
       applyInputIsClientTarget,
       outputClientPathsDistinct: true,
       profileClientRootRequired: true,
@@ -560,6 +663,18 @@ function validateDeployPreview(previewFile) {
   assertCondition(inputs.baselineContinuityOk === preview.baselineContinuityOk, "Deployment baseline continuity evidence was altered.");
   assertCondition(inputs.baselineSwitchConfirmed === preview.baselineSwitchConfirmed, "Deployment baseline-switch confirmation was altered.");
   assertCondition(inputs.applyInputIsClientTarget === preview.applyInputIsClientTarget, "Deployment apply-input/client relationship was altered.");
+  assertCondition(
+    inputs.protectedSourceOriginIsClientTarget === preview.protectedSourceOriginIsClientTarget,
+    "Deployment protected-source origin/client relationship was altered.",
+  );
+  assertCondition(
+    inputs.protectedSourceAnchorPromoted === preview.protectedSourceAnchorPromoted,
+    "Deployment protected-source anchor evidence was altered.",
+  );
+  assertCondition(
+    inputs.clientBackupReusesProtectedSourceAnchor === preview.clientBackupReusesProtectedSourceAnchor,
+    "Deployment client-backup reuse evidence was altered.",
+  );
   return {
     previewManifestPath,
     previewManifestSha256: sha256File(previewManifestPath),
@@ -744,11 +859,30 @@ function executeDeploy(options) {
   assertCondition(profile?.name === loaded.inputs.profileName, "The selected profile no longer matches the deployment preview.");
   const client = resolveClientContext(profile, policy);
   const apply = validateApplyManifest(loaded.inputs.applyManifest);
+  const applyInputIsClientTarget =
+    samePath(client.clientPvf, apply.sourcePvf) ||
+    samePath(client.clientPvfRealPath, apply.sourcePvfRealPath);
+  const protectedSourceOriginIsClientTarget =
+    samePath(client.clientPvf, apply.protectedSourceOriginPvf) ||
+    samePath(client.clientPvfRealPath, apply.protectedSourceOriginPvfRealPath);
   assertCondition(
-    typeof profile.sourcePvf === "string" &&
-      (samePath(profile.sourcePvf, apply.protectedSourcePvf) ||
-        samePath(prospectiveRealPath(profile.sourcePvf), apply.protectedSourcePvfRealPath)),
-    "The deployment profile sourcePvf changed or no longer matches the protected source in the apply manifest.",
+    applyInputIsClientTarget === loaded.inputs.applyInputIsClientTarget,
+    "Apply input/client relationship changed after deployment preview.",
+    "STALE_DEPLOY_PREVIEW",
+  );
+  assertCondition(
+    protectedSourceOriginIsClientTarget === loaded.inputs.protectedSourceOriginIsClientTarget,
+    "Protected-source origin/client relationship changed after deployment preview.",
+    "STALE_DEPLOY_PREVIEW",
+  );
+  assertCondition(
+    apply.sourcePvfUnchanged || applyInputIsClientTarget,
+    "Apply source PVF changed after deployment preview.",
+    "APPLY_SOURCE_CHANGED",
+  );
+  assertCondition(
+    profileMatchesApplyProtectedSource(profile, apply),
+    "The deployment profile sourcePvf changed or no longer matches the protected source anchor/origin in the apply manifest.",
     "PROFILE_APPLY_SOURCE_MISMATCH",
   );
   assertCondition(
@@ -775,8 +909,13 @@ function executeDeploy(options) {
     !samePath(client.clientPvfRealPath, apply.outputPvfRealPath),
     "Refusing to deploy over the resolved independent apply output.",
   );
-  const expectedBackupPath = backupPathFor(client, client.clientPvfSha256, policy);
+  const expectedBackupPlan = deployBackupPlan(client, apply, policy, protectedSourceOriginIsClientTarget);
+  const expectedBackupPath = expectedBackupPlan.path;
   assertCondition(samePath(expectedBackupPath, loaded.inputs.backupPath), "Client backup path changed after deployment preview.");
+  assertCondition(
+    expectedBackupPlan.reusesProtectedSourceAnchor === loaded.inputs.clientBackupReusesProtectedSourceAnchor,
+    "Client backup reuse plan changed after deployment preview.",
+  );
 
   const manifestPath = path.resolve(loaded.inputs.deploymentManifestPath);
   assertOutsideWorkbench(manifestPath, "Deployment manifest");
@@ -798,6 +937,7 @@ function executeDeploy(options) {
     sourcePvf: apply.sourcePvf,
     sourcePvfSha256: apply.sourcePvfSha256,
     protectedSourcePvf: apply.protectedSourcePvf,
+    protectedSourceOriginPvf: apply.protectedSourceOriginPvf,
     protectedSourcePvfSha256: apply.protectedSourcePvfSha256,
     outputPvf: apply.outputPvf,
     outputPvfSha256: apply.outputPvfSha256,
@@ -822,6 +962,11 @@ function executeDeploy(options) {
       clientClosedConfirmed: true,
       sourcePvfModified: false,
       protectedSourcePvfModified: false,
+      protectedSourceOriginIsClientTarget: loaded.inputs.protectedSourceOriginIsClientTarget,
+      protectedSourceAnchorPromoted: loaded.inputs.protectedSourceAnchorPromoted,
+      clientOriginSourceProtectedByVerifiedBackup:
+        loaded.inputs.protectedSourceOriginIsClientTarget === true && apply.verifiedProtectedSourceBackup === true,
+      clientBackupReusesProtectedSourceAnchor: loaded.inputs.clientBackupReusesProtectedSourceAnchor,
       applyInputIsClientTarget: loaded.inputs.applyInputIsClientTarget,
       applyInputPvfModifiedByDeployment: false,
       applyOutputModified: false,
@@ -872,6 +1017,9 @@ function executeDeploy(options) {
       baselineSwitchConfirmed: loaded.inputs.baselineSwitchConfirmed,
       applyInputIsClientTarget: loaded.inputs.applyInputIsClientTarget,
       applyInputPvfModifiedByDeployment: loaded.inputs.applyInputIsClientTarget === true,
+      protectedSourceOriginIsClientTarget: loaded.inputs.protectedSourceOriginIsClientTarget,
+      protectedSourceAnchorPromoted: loaded.inputs.protectedSourceAnchorPromoted,
+      clientBackupReusesProtectedSourceAnchor: loaded.inputs.clientBackupReusesProtectedSourceAnchor,
       backupPath: backup.path,
       backupSha256: backup.sha256,
     };
@@ -929,6 +1077,18 @@ function validateDeploymentManifest(manifestFile) {
   assertCondition(inputs.baselineContinuityOk === manifest.baselineContinuityOk, "Deployment baseline continuity differs from its completion binding.");
   assertCondition(inputs.baselineSwitchConfirmed === manifest.baselineSwitchConfirmed, "Deployment baseline-switch evidence differs from its completion binding.");
   assertCondition(inputs.applyInputIsClientTarget === manifest.applyInputIsClientTarget, "Deployment apply-input/client relationship differs from its completion binding.");
+  assertCondition(
+    inputs.protectedSourceOriginIsClientTarget === manifest.safety?.protectedSourceOriginIsClientTarget,
+    "Deployment protected-source origin/client relationship differs from its completion binding.",
+  );
+  assertCondition(
+    inputs.protectedSourceAnchorPromoted === manifest.safety?.protectedSourceAnchorPromoted,
+    "Deployment protected-source anchor evidence differs from its completion binding.",
+  );
+  assertCondition(
+    inputs.clientBackupReusesProtectedSourceAnchor === manifest.safety?.clientBackupReusesProtectedSourceAnchor,
+    "Deployment client-backup reuse evidence differs from its completion binding.",
+  );
   assertCondition(
     inputs.applyInputPvfModifiedByDeployment === manifest.safety?.applyInputPvfModifiedByDeployment,
     "Deployment apply-input modification evidence differs from its completion binding.",
@@ -1196,6 +1356,11 @@ function visibleDeployPreview(preview) {
     currentClientSha256: preview.clientPvfSha256Before,
     outputPvf: preview.outputPvf,
     outputPvfSha256: preview.outputPvfSha256,
+    protectedSourceAnchorPromoted: preview.protectedSourceAnchorPromoted,
+    clientOriginSourceProtectedByVerifiedBackup:
+      preview.safety.clientOriginSourceProtectedByVerifiedBackup,
+    clientBackupReusesProtectedSourceAnchor:
+      preview.safety.clientBackupReusesProtectedSourceAnchor,
     backupPath: preview.backupPath,
     approvalCode: preview.binding?.approvalCode || null,
     nextStep: preview.ready
@@ -1217,6 +1382,11 @@ function visibleDeployment(manifest) {
     afterSha256: manifest.clientPvfSha256After,
     backupPath: manifest.backupPath,
     backupReused: manifest.backup?.reused || false,
+    protectedSourceAnchor: manifest.protectedSourcePvf,
+    clientOriginSourceProtectedByVerifiedBackup:
+      manifest.safety.clientOriginSourceProtectedByVerifiedBackup,
+    clientBackupReusesProtectedSourceAnchor:
+      manifest.safety.clientBackupReusesProtectedSourceAnchor,
     nonPvfClientResourcesWritten: false,
   };
 }
@@ -1299,6 +1469,14 @@ function selfTest(options) {
     const outputSha = sha256File(outputPvf);
     const originalClientSha = sha256File(clientPvf);
     const markerSha = sha256File(markerNpk);
+    const sourceBackupPvf = path.join(
+      profileOutput,
+      "pvf-source-backups",
+      "sha256",
+      sourceSha + ".Script.pvf",
+    );
+    fs.mkdirSync(path.dirname(sourceBackupPvf), { recursive: true });
+    fs.copyFileSync(sourcePvf, sourceBackupPvf);
 
     const applyManifestPath = path.join(applyDir, "APPLY-MANIFEST.json");
     const applyManifest = {
@@ -1306,13 +1484,20 @@ function selfTest(options) {
       phase: "phase-3-controlled-output-apply",
       mode: "controlled-output-only",
       sourcePvf,
+      protectedSourcePvf: sourceBackupPvf,
+      protectedSourceOriginPvf: sourcePvf,
       outputPvf,
       sourcePvfSha256: sourceSha,
+      protectedSourcePvfSha256: sourceSha,
       outputPvfSha256: outputSha,
       outputPvfBytes: fs.statSync(outputPvf).size,
+      backupPath: sourceBackupPvf,
       safety: {
         sourceOverwritten: false,
+        sourceUnchanged: true,
         backupCreated: true,
+        backupContentAddressed: true,
+        backupSha256Verified: true,
         matchingDryRunVerified: true,
         explicitUserAuthorizationVerified: true,
         readbackOk: true,
@@ -1382,7 +1567,8 @@ function selfTest(options) {
     const cumulativeClientInputManifest = JSON.parse(JSON.stringify(applyManifest));
     cumulativeClientInputManifest.sourcePvf = clientPvf;
     cumulativeClientInputManifest.sourcePvfSha256 = originalClientSha;
-    cumulativeClientInputManifest.protectedSourcePvf = sourcePvf;
+    cumulativeClientInputManifest.protectedSourcePvf = sourceBackupPvf;
+    cumulativeClientInputManifest.protectedSourceOriginPvf = sourcePvf;
     cumulativeClientInputManifest.protectedSourcePvfSha256 = sourceSha;
     cumulativeClientInputManifest.cumulative = {
       enabled: true,
@@ -1680,21 +1866,115 @@ function selfTest(options) {
       sourcePvf: clientPvf,
       sourcePvfSha256: originalClientSha,
       protectedSourcePvf: clientPvf,
+      protectedSourceOriginPvf: clientPvf,
       protectedSourcePvfSha256: originalClientSha,
+      backupPath: sourceBackupPvf,
     };
     writeJson(collisionManifestPath, collisionManifest);
+    const unanchoredCollisionManifestPath = path.join(applyDir, "UNANCHORED-COLLISION-APPLY-MANIFEST.json");
+    const unanchoredCollisionManifest = JSON.parse(JSON.stringify(collisionManifest));
+    delete unanchoredCollisionManifest.backupPath;
+    delete unanchoredCollisionManifest.safety.backupContentAddressed;
+    delete unanchoredCollisionManifest.safety.backupSha256Verified;
+    writeJson(unanchoredCollisionManifestPath, unanchoredCollisionManifest);
+    const clientOriginProfile = { ...profile, sourcePvf: clientPvf };
     expectFailure(
       checks,
-      "source-client-collision-rejected",
+      "unanchored-source-client-collision-rejected",
       () =>
         createDeployPreview({
           policy,
-          profile,
-          applyManifestPath: collisionManifestPath,
-          outRoot: path.join(tempRoot, "runs", "collision"),
+          profile: clientOriginProfile,
+          applyManifestPath: unanchoredCollisionManifestPath,
+          outRoot: path.join(tempRoot, "runs", "unanchored-collision"),
         }),
       "SOURCE_CLIENT_COLLISION",
     );
+    const misnamedBackupPvf = path.join(profileOutput, "pvf-source-backups", "sha256", "misnamed.Script.pvf");
+    fs.copyFileSync(sourceBackupPvf, misnamedBackupPvf);
+    const misnamedBackupManifestPath = path.join(applyDir, "MISNAMED-BACKUP-APPLY-MANIFEST.json");
+    writeJson(misnamedBackupManifestPath, { ...collisionManifest, backupPath: misnamedBackupPvf });
+    expectFailure(
+      checks,
+      "misnamed-protected-source-backup-rejected",
+      () =>
+        createDeployPreview({
+          policy,
+          profile: clientOriginProfile,
+          applyManifestPath: misnamedBackupManifestPath,
+          outRoot: path.join(tempRoot, "runs", "misnamed-backup"),
+        }),
+      "APPLY_PROTECTED_SOURCE_BACKUP_PATH_INVALID",
+    );
+    const clientOriginPreview = createDeployPreview({
+      policy,
+      profile: clientOriginProfile,
+      applyManifestPath: collisionManifestPath,
+      outRoot: path.join(tempRoot, "runs", "client-origin-source"),
+    });
+    checks.push({
+      id: "verified-backup-promotes-client-origin-to-protected-anchor",
+      ok:
+        clientOriginPreview.ready === true &&
+        clientOriginPreview.protectedSourceOriginIsClientTarget === true &&
+        clientOriginPreview.protectedSourceAnchorPromoted === true &&
+        clientOriginPreview.safety.clientOriginSourceProtectedByVerifiedBackup === true &&
+        clientOriginPreview.safety.clientBackupReusesProtectedSourceAnchor === true &&
+        samePath(clientOriginPreview.backupPath, sourceBackupPvf) &&
+        sha256File(clientPvf) === originalClientSha &&
+        sha256File(sourceBackupPvf) === sourceSha,
+    });
+    const clientOriginDeployment = executeDeploy({
+      policy,
+      profile: clientOriginProfile,
+      previewManifestPath: clientOriginPreview.previewManifestPath,
+      authorizationCode: clientOriginPreview.binding.approvalCode,
+      clientClosedConfirmed: true,
+    });
+    checks.push({
+      id: "client-origin-source-deploys-without-manual-copy",
+      ok:
+        clientOriginDeployment.status === "deployed" &&
+        clientOriginDeployment.safety.clientOriginSourceProtectedByVerifiedBackup === true &&
+        clientOriginDeployment.safety.clientBackupReusesProtectedSourceAnchor === true &&
+        clientOriginDeployment.backup?.reused === true &&
+        samePath(clientOriginDeployment.backupPath, sourceBackupPvf) &&
+        clientOriginDeployment.safety.protectedSourcePvfModified === false &&
+        sha256File(clientPvf) === outputSha &&
+        sha256File(sourceBackupPvf) === sourceSha &&
+        sha256File(outputPvf) === outputSha &&
+        sha256File(markerNpk) === markerSha,
+    });
+    const clientOriginNoChange = createDeployPreview({
+      policy,
+      profile: clientOriginProfile,
+      applyManifestPath: collisionManifestPath,
+      outRoot: path.join(tempRoot, "runs", "client-origin-no-change"),
+    });
+    checks.push({
+      id: "client-origin-already-deployed-is-no-op",
+      ok: clientOriginNoChange.ready === false && clientOriginNoChange.noChange === true,
+    });
+    const clientOriginRollbackPreview = createRollbackPreview({
+      policy,
+      profile: clientOriginProfile,
+      deploymentManifestPath: clientOriginDeployment.manifestPath,
+      outRoot: path.join(tempRoot, "runs", "client-origin-rollback"),
+    });
+    executeRollback({
+      policy,
+      profile: clientOriginProfile,
+      previewManifestPath: clientOriginRollbackPreview.previewManifestPath,
+      authorizationCode: clientOriginRollbackPreview.binding.approvalCode,
+      clientClosedConfirmed: true,
+    });
+    checks.push({
+      id: "client-origin-rollback-restores-exact-baseline",
+      ok:
+        sha256File(clientPvf) === originalClientSha &&
+        sha256File(sourceBackupPvf) === sourceSha &&
+        sha256File(markerNpk) === markerSha,
+    });
   } finally {
     assertCondition(pathInside(os.tmpdir(), tempRoot), "Unsafe client deployment self-test cleanup path.");
     fs.rmSync(tempRoot, { recursive: true, force: true });

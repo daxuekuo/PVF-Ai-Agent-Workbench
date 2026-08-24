@@ -25,13 +25,20 @@ const {
   verifiedInlineTextSelfTest,
   verifiedInlineTextBatchStressSelfTest,
 } = require("../../../tools/pvf-bridge/verified-inline-cn-text");
+const { bytePreservingAsciiTextSelfTest } = require("../../../tools/pvf-bridge/byte-preserving-ascii-text");
 const {
   analyzeContextAnchoredReplacement,
   applyContextAnchoredReplacement,
   occurrenceMismatch,
 } = require("../../../tools/pvf-bridge/context-anchored-replace");
 const {
+  EXISTING_NUT_CONTROLLED_MODE,
   HIGH_RISK_NEW_FILE_MODES,
+  containsExactFunctionCall,
+  containsExactIdentifier,
+  containsExactInteger,
+  containsExactIntegerInFunctionCall,
+  containsExecutableFragment,
   extensionOf,
   normalizePvfPath: normalizeAuditedPvfPath,
   parseRegistryRows,
@@ -40,6 +47,8 @@ const {
   parseWorldmapText,
   parseWorldmapUiButtons,
   resolveRegistryEntryPath,
+  validateExistingNutTextTransition,
+  validateExistingNutWriteProofShape,
   validateNewFileText,
   validateRegistryLifecycleTransition,
   validateRegistryRowProof,
@@ -50,6 +59,7 @@ const rawArgs = process.argv.slice(2);
 const workbenchRoot = resolveWorkbenchRoot(rawArgs, path.resolve(__dirname, "../../.."));
 const args = rawArgs.filter((item, index) => !(item === "--root" || rawArgs[index - 1] === "--root"));
 const command = args[0];
+const COPY_FILE_CHANGE_TYPE = "copy-file";
 
 function usage() {
   return `Usage:
@@ -77,7 +87,10 @@ function changeSetPlanSummary(changeSet) {
       item.type === "replace-text" && isVerifiedInlineTextMode(item.textWriteMode)).length,
     exactRangeScopeCount: group.changes.filter((item) =>
       item.type === "replace-text" && item.scope).length,
+    existingNutControlledCount: group.changes.filter((item) =>
+      item.type === "replace-text" && item.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE).length,
     writeFileCount: group.changes.filter((item) => item.type === "write-file").length,
+    copyFileCount: group.changes.filter((item) => item.type === COPY_FILE_CHANGE_TYPE).length,
   }));
   return {
     pathCount: paths.length,
@@ -120,12 +133,27 @@ function changeSetAgentHandoff(changeSet, file) {
       instruction: "连续第二轮仍让 target.sourcePvf 指向最初受保护源，并用 baseline.applyManifest 指向上一轮成功的 APPLY-MANIFEST.json；按 nextCommandOnly 原样预演，不要自行增加指向最初源的 --pvf。只有明确覆盖时，--pvf 才能指向上一轮记录绑定的 outputPvf；不要把它写成新的 target.sourcePvf。",
       example: "workspaces/examples/change-set.cumulative-second-round.example.json",
     },
+    existingNutControlledEdit: {
+      enabled: plan.paths.some((item) => item.existingNutControlledCount > 0),
+      instruction: "既有 .nut 仍默认受保护；专用路线只接受同一文件完全一致的 writeProof，并在预演中核验原文 SHA256、load_state/passive/appendage 加载链、函数/API/APID、临时独立 PVF 往返和独立读回。静态通过后仍必须实机验证。",
+      example: "workspaces/examples/change-set.existing-nut-controlled.example.json",
+    },
+    pvfInternalCopyNewFile: {
+      enabled: plan.paths.some((item) => item.copyFileCount > 0),
+      instruction: "普通文本文件可用 copy-file 从同一目标 PVF 复制为不存在的同扩展名新路径；工作台会绑定完整源文本并进行临时独立读回。复制轮不得对新路径混入 replace-text；修改克隆内容必须使用成功 APPLY-MANIFEST.json 开始累计第二轮。高风险扩展名仍走专用 writeProof 路线。",
+      example: "workspaces/examples/change-set.copy-pvf-file.example.json",
+    },
+    numericDecimalReplacement: {
+      instruction: "整数与小数可以互相修改，但 previousText 应包含同次 --raw 读回的完整字段标签和原值（例如 [attack damage rate]\\r\\n1 → [attack damage rate]\\r\\n0.8），不要只替换在文件中重复出现的裸 1。",
+    },
     prohibitedFollowUp: [
       "inspect pvf-change-set.js implementation",
       "split same-path changes into chained fresh sources",
       "treat replaceAll=false as a declared bulk count",
       "reuse reader-friendly display text as previousText",
       "invent scope markers instead of copying them from the same raw readback",
+      "remove the existing NUT proof or treat static checks as runtime success",
+      "mix copy-file and replace-text on the same target before a cumulative next round",
     ],
   };
 }
@@ -164,6 +192,22 @@ function dryRunAgentHandoff(file, manifestPath, approvalCode, blockedChanges = [
   };
 }
 
+function applyAgentHandoff(manifestPath, manifest) {
+  const quotedManifest = handoffCommandArgument(manifestPath);
+  const quotedProfile = handoffCommandArgument(manifest.sourceProfile);
+  const commandAvailable = Boolean(quotedManifest && quotedProfile);
+  return {
+    controlledOutputComplete: true,
+    clientDeploymentSeparatelyAuthorized: true,
+    nextCommandOnly: commandAvailable
+      ? `workbench.bat client-pvf preview --profile ${quotedProfile} --apply-manifest ${quotedManifest}`
+      : null,
+    instruction: commandAvailable
+      ? "若用户已明确要求安装到该 profile 的测试客户端，直接执行 nextCommandOnly；预览不会修改客户端，也不要手工复制 PVF。"
+      : "如需安装到测试客户端，请先使用已配置 client 的 profile，再运行 client-pvf preview；不要手工复制 PVF。",
+  };
+}
+
 function option(name, fallback) {
   const index = args.indexOf(name);
   return index >= 0 && args[index + 1] ? args[index + 1] : fallback;
@@ -179,6 +223,18 @@ function requireOption(name) {
 
 function sha256(value) {
   return crypto.createHash("sha256").update(value).digest("hex");
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonicalJson(value[key])]));
+  }
+  return value;
+}
+
+function canonicalJsonSha256(value) {
+  return sha256(JSON.stringify(canonicalJson(value)));
 }
 
 function outputPvfIdentity(file) {
@@ -202,11 +258,9 @@ function sourceBackupPath(sourcePvf, sourcePvfSha256, externalOutputRoot) {
   const resolvedOutputRoot = path.resolve(externalOutputRoot);
   const backupRoot = path.join(resolvedOutputRoot, "pvf-source-backups", "sha256");
   const backupPath = path.join(backupRoot, `${sourcePvfSha256.toLowerCase()}.Script.pvf`);
-  if (samePath(sourcePvf, backupPath)) {
-    const error = new Error("Calculated source backup path collides with the source PVF.");
-    error.code = "BACKUP_SOURCE_COLLISION";
-    throw error;
-  }
+  // A cumulative chain may already use this verified content-addressed file as
+  // its protected source anchor. Reusing that exact path is intentional: the
+  // hash is checked again by ensureContentAddressedSourceBackup before apply.
   return backupPath;
 }
 
@@ -402,6 +456,12 @@ function dryRunBinding(results, sourcePvf, sourcePvfSha256, changeSetFile, chang
       newFileRoundTripProbeSha256: item.roundTripProbe
         ? sha256(JSON.stringify(item.roundTripProbe))
         : null,
+      existingNutAuditSha256: item.existingNutAudit
+        ? canonicalJsonSha256(item.existingNutAudit)
+        : null,
+      existingNutRoundTripProbeSha256: item.existingNutRoundTripProbe
+        ? canonicalJsonSha256(item.existingNutRoundTripProbe)
+        : null,
     })),
   };
   const bindingSha256 = sha256(JSON.stringify(payload));
@@ -448,7 +508,79 @@ function verifyDryRunAuthorization(sourcePvf, changeSetFile, explicit = {}) {
   }
   for (const result of manifest.results || []) {
     if (result.type === "replace-text" && !isVerifiedInlineTextMode(result.textWriteMode) && result.changed === true) {
-      if (result.writeProof?.mode === "registry-lifecycle") {
+      if (result.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE) {
+        const audit = result.existingNutAudit;
+        const probe = result.existingNutRoundTripProbe;
+        if (
+          audit?.ok !== true ||
+          audit?.transition?.ok !== true ||
+          audit?.runtimeValidationRequired !== true ||
+          audit?.staticChecksProveRuntimeBehavior !== false ||
+          !Array.isArray(audit?.loadChainChecks) || audit.loadChainChecks.length < 2 ||
+          audit?.loadChainChecks?.some((item) => item.exactReferencePresent !== true) ||
+          !Array.isArray(audit?.apiSymbolChecks) || audit.apiSymbolChecks.length < 1 ||
+          audit?.apiSymbolChecks?.some((item) => item.catalogDeclared !== true || item.finalTargetUsesSymbol !== true || !item.targetEvidence?.some((entry) => entry.exactSymbolPresent === true)) ||
+          !Array.isArray(audit?.apidChecks) || audit.apidChecks.length !== (result.writeProof?.apidPlan?.ids?.length || 0) ||
+          audit?.apidChecks?.some((item) => item.complete !== true || item.collisions?.length !== 0 || item.finalTargetContainsId !== true) ||
+          probe?.ok !== true ||
+          probe?.sourceUnchanged !== true ||
+          probe?.independentSemanticRead !== true ||
+          probe?.semanticReadGuard?.reason !== "verified-text-readback" ||
+          probe?.semanticReadGuard?.backend !== "typescript-readonly-fallback" ||
+          probe?.comparison?.ok !== true ||
+          probe?.rawByteReadbackOk !== true ||
+          String(probe?.expectedOutputRawSha256 || "").toLowerCase() !==
+            String(result.rawAsciiTokenPlanProof?.outputRawSha256 || "").toLowerCase() ||
+          String(probe?.actualOutputRawSha256 || "").toLowerCase() !==
+            String(probe?.expectedOutputRawSha256 || "").toLowerCase() ||
+          probe?.temporaryOutputRetained !== false ||
+          probe?.runtimeValidationRequired !== true ||
+          String(probe?.sourcePvfSha256 || "").toLowerCase() !== String(binding.sourcePvfSha256 || "").toLowerCase() ||
+          !/^[a-f0-9]{64}$/iu.test(String(probe?.temporaryOutputPvfSha256 || ""))
+        ) {
+          const error = new Error(`既有 NUT 改动 ${result.id} 缺少完整的加载链/API/APID 审计或临时独立读回证据；请重新预演。`);
+          error.code = "EXISTING_NUT_DRY_RUN_PROOF_REQUIRED";
+          throw error;
+        }
+      }
+      if (result.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE) {
+        const proof = result.rawAsciiTokenPlanProof;
+        if (
+          proof?.mode !== EXISTING_NUT_CONTROLLED_MODE ||
+          proof?.encoding !== result.pvfEncoding ||
+          typeof proof?.originalRawBytesReencodedExactly !== "boolean" ||
+          proof?.rawBytePreservingPatch !== true ||
+          proof?.wholeFileReencodingUsed !== false ||
+          proof?.sourceDecodedTextBound !== true ||
+          proof?.nonTargetRawBytesPreserved !== true ||
+          proof?.replacementCharactersPreserved !== true ||
+          proof?.stepNonTargetRawBytesPreserved !== true ||
+          proof?.existingStringEntriesPreserved !== true ||
+          proof?.stringTableUntouched !== true ||
+          proof?.appendedStringEntryCount !== 0 ||
+          proof?.transitionAuditOk !== true ||
+          proof?.sourceTextSha256 !== result.existingNutAudit?.transition?.sourceTextSha256 ||
+          proof?.finalTextSha256 !== result.finalFileExpectedSha256 ||
+          Number(proof?.expectedOccurrences) !== Number(result.expectedOccurrences) ||
+          Number(proof?.occurrenceCount) !== Number(result.occurrenceCount) ||
+          !Number.isSafeInteger(proof?.preservedRawByteCount) || proof.preservedRawByteCount < 0 ||
+          !Number.isSafeInteger(proof?.removedRawByteCount) || proof.removedRawByteCount < 1 ||
+          !Number.isSafeInteger(proof?.insertedRawByteCount) || proof.insertedRawByteCount < 0 ||
+          !/^[a-f0-9]{64}$/iu.test(String(proof?.sourceRawSha256 || "")) ||
+          !/^[a-f0-9]{64}$/iu.test(String(proof?.outputRawSha256 || "")) ||
+          !/^[a-f0-9]{64}$/iu.test(String(proof?.preservedRawBytesSha256 || "")) ||
+          !/^[a-f0-9]{64}$/iu.test(String(proof?.unchangedRangesSha256 || "")) ||
+          !/^[a-f0-9]{64}$/iu.test(String(proof?.replacementRangesSha256 || "")) ||
+          (result.contextAnchor && (
+            proof?.contextAnchor?.selectorSha256 !== result.contextAnchor.selectorSha256 ||
+            proof?.contextAnchor?.locationBindingSha256 !== result.contextAnchor.locationBindingSha256
+          ))
+        ) {
+          const error = new Error(`既有 NUT 改动 ${result.id} 缺少原始字节/目标编码精确预演证明；请重新预演。`);
+          error.code = "EXISTING_NUT_RAW_TEXT_PLAN_REQUIRED";
+          throw error;
+        }
+      } else if (result.writeProof?.mode === "registry-lifecycle") {
         const proof = result.rawAsciiTokenPlanProof?.proof || result.rawAsciiTokenPlanProof;
         if (
           proof?.mode !== "registry-lifecycle" ||
@@ -495,6 +627,28 @@ function verifyDryRunAuthorization(sourcePvf, changeSetFile, explicit = {}) {
           error.code = "HIGH_RISK_NEW_FILE_PROOF_REQUIRED";
           throw error;
         }
+      }
+    }
+    if (result.type === COPY_FILE_CHANGE_TYPE && result.changed === true) {
+      const probe = result.roundTripProbe;
+      if (
+        result.semanticWriteSafety?.allowed !== true ||
+        result.semanticWriteSafety?.details?.mode !== "same-pvf-copy" ||
+        result.semanticWriteSafety?.details?.sourcePvfPath !== result.sourcePvfPath ||
+        result.semanticWriteSafety?.details?.sourceTextSha256 !== result.sourceTextSha256 ||
+        probe?.ok !== true ||
+        probe?.sourceUnchanged !== true ||
+        probe?.independentSemanticRead !== true ||
+        probe?.semanticReadGuard?.reason !== "verified-text-readback" ||
+        probe?.semanticReadGuard?.backend !== "typescript-readonly-fallback" ||
+        probe?.comparison?.ok !== true ||
+        probe?.temporaryOutputRetained !== false ||
+        String(probe?.sourcePvfSha256 || "").toLowerCase() !== String(binding.sourcePvfSha256 || "").toLowerCase() ||
+        !/^[a-f0-9]{64}$/iu.test(String(probe?.outputPvfSha256 || ""))
+      ) {
+        const error = new Error(`同一 PVF 文件复制 ${result.id} 缺少完整源文本绑定、临时写出或独立读回证据；请重新预演。`);
+        error.code = "COPY_FILE_ROUNDTRIP_REQUIRED";
+        throw error;
       }
     }
     if (!isVerifiedInlineTextMode(result.textWriteMode) || result.changed !== true) continue;
@@ -568,7 +722,7 @@ function pathInside(root, candidate) {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-function changeSetAuthorizationSelfTest() {
+async function changeSetAuthorizationSelfTest() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pvf-change-binding-"));
   const checks = [];
   try {
@@ -779,6 +933,78 @@ function changeSetAuthorizationSelfTest() {
       ok: verifiedProbeAccepted.binding.bindingSha256 === verifiedBinding.bindingSha256,
     });
 
+    const copyManifestFile = path.join(tempRoot, "DRY-RUN-COPY-FILE-MANIFEST.json");
+    const copySourceTextSha256 = sha256("copy-source-text");
+    const copyResults = [{
+      id: "copy-file-fixture",
+      type: COPY_FILE_CHANGE_TYPE,
+      pvfPath: "dungeon/fixture/copied.tbl",
+      sourcePvfPath: "monster/monsterapcdifficultybonus.tbl",
+      sourceTextSha256: copySourceTextSha256,
+      applicable: true,
+      changed: true,
+      semanticWriteSafety: {
+        allowed: true,
+        details: {
+          mode: "same-pvf-copy",
+          sourcePvfPath: "monster/monsterapcdifficultybonus.tbl",
+          sourceTextSha256: copySourceTextSha256,
+        },
+      },
+    }];
+    let copyBinding = dryRunBinding(copyResults, sourcePvf, sha256File(sourcePvf), changeSetFile, sha256File(changeSetFile));
+    fs.writeFileSync(copyManifestFile, `${JSON.stringify({
+      schemaVersion: "1.0",
+      phase: "phase-3-dry-run-change-set",
+      mode: "dry-run-only",
+      writeOperationsExecuted: false,
+      persistentWriteOperationsExecuted: false,
+      temporaryVerificationWriteOperationsExecuted: true,
+      summary: { blockedCount: 0 },
+      binding: copyBinding,
+      results: copyResults,
+    }, null, 2)}\n`, "utf8");
+    let missingCopyProbeRejected = false;
+    try {
+      verifyDryRunAuthorization(sourcePvf, changeSetFile, {
+        manifestFile: copyManifestFile,
+        authorizationCode: copyBinding.approvalCode,
+      });
+    } catch (error) {
+      missingCopyProbeRejected = error.code === "COPY_FILE_ROUNDTRIP_REQUIRED";
+    }
+    checks.push({ id: "same-pvf-copy-missing-roundtrip-rejected", ok: missingCopyProbeRejected });
+    copyResults[0].roundTripProbe = {
+      ok: true,
+      sourceUnchanged: true,
+      independentSemanticRead: true,
+      semanticReadGuard: { reason: "verified-text-readback", backend: "typescript-readonly-fallback" },
+      comparison: { ok: true, exactTextOk: true },
+      sourcePvfSha256: sha256File(sourcePvf),
+      outputPvfSha256: sha256("copy-temporary-output"),
+      temporaryOutputRetained: false,
+    };
+    copyBinding = dryRunBinding(copyResults, sourcePvf, sha256File(sourcePvf), changeSetFile, sha256File(changeSetFile));
+    fs.writeFileSync(copyManifestFile, `${JSON.stringify({
+      schemaVersion: "1.0",
+      phase: "phase-3-dry-run-change-set",
+      mode: "dry-run-only",
+      writeOperationsExecuted: false,
+      persistentWriteOperationsExecuted: false,
+      temporaryVerificationWriteOperationsExecuted: true,
+      summary: { blockedCount: 0 },
+      binding: copyBinding,
+      results: copyResults,
+    }, null, 2)}\n`, "utf8");
+    const copyProbeAccepted = verifyDryRunAuthorization(sourcePvf, changeSetFile, {
+      manifestFile: copyManifestFile,
+      authorizationCode: copyBinding.approvalCode,
+    });
+    checks.push({
+      id: "same-pvf-copy-complete-roundtrip-authorized",
+      ok: copyProbeAccepted.binding.bindingSha256 === copyBinding.bindingSha256,
+    });
+
     fs.writeFileSync(sourcePvf, "pvf-fixture-v2", "utf8");
     let changedSourceRejected = false;
     try {
@@ -876,6 +1102,38 @@ function changeSetAuthorizationSelfTest() {
         cumulativeInput.cumulative.previousChangeCount === 3 &&
         cumulativeInput.cumulative.chainDepth === 1,
     });
+    const protectedSourceBackup = path.join(
+      tempRoot,
+      "profile-output",
+      "pvf-source-backups",
+      "sha256",
+      sha256File(sourcePvf) + ".Script.pvf",
+    );
+    fs.mkdirSync(path.dirname(protectedSourceBackup), { recursive: true });
+    fs.copyFileSync(sourcePvf, protectedSourceBackup);
+    const promotedApplyManifest = path.join(tempRoot, "PROMOTED-CUMULATIVE-APPLY-MANIFEST.json");
+    const promotedManifest = readJson(cumulativeApplyManifest);
+    promotedManifest.backupPath = protectedSourceBackup;
+    promotedManifest.safety.backupCreated = true;
+    promotedManifest.safety.backupContentAddressed = true;
+    promotedManifest.safety.backupSha256Verified = true;
+    fs.writeFileSync(promotedApplyManifest, `${JSON.stringify(promotedManifest, null, 2)}\n`, "utf8");
+    fs.writeFileSync(sourcePvf, "client-now-contains-deployed-output", "utf8");
+    const promotedInput = resolveChangeInput(
+      { target: { sourcePvf }, baseline: { applyManifest: promotedApplyManifest } },
+      changeSetFile,
+      null,
+      null,
+    );
+    checks.push({
+      id: "cumulative-client-origin-uses-verified-protected-backup-anchor",
+      ok:
+        promotedInput.sourcePvf === cumulativeOutputPvf &&
+        promotedInput.protectedSourcePvf === protectedSourceBackup &&
+        promotedInput.protectedSourceOriginPvf === sourcePvf &&
+        promotedInput.cumulative.previousChangeCount === 3,
+    });
+    fs.writeFileSync(sourcePvf, "pvf-fixture-v1", "utf8");
     fs.writeFileSync(cumulativeOutputPvf, "tampered-output", "utf8");
     let tamperedBaselineRejected = false;
     try {
@@ -975,6 +1233,38 @@ function changeSetAuthorizationSelfTest() {
       ok: !directChineseSafety.allowed && directChineseSafety.code === "NON_ASCII_TEXT_WRITE_UNVERIFIED",
     });
 
+    const samePvfCopyText = "#PVF_File\r\n[monster]\r\n1\t`既有中文注释`\r\n";
+    const samePvfCopySafety = semanticWriteSafety({
+      kind: COPY_FILE_CHANGE_TYPE,
+      pvfPath: "dungeon/fixture/difficulty_copy.tbl",
+      pvfEncoding: "Cn",
+      textContent: samePvfCopyText,
+      samePvfCopyProof: {
+        mode: "same-pvf-copy",
+        sourcePvfPath: "monster/monsterapcdifficultybonus.tbl",
+        sourceTextSha256: sha256(samePvfCopyText),
+      },
+    });
+    checks.push({
+      id: "same-pvf-ordinary-text-copy-preserves-bound-non-ascii-source",
+      ok: samePvfCopySafety.allowed === true && samePvfCopySafety.details?.mode === "same-pvf-copy",
+    });
+    const highRiskSamePvfCopy = semanticWriteSafety({
+      kind: COPY_FILE_CHANGE_TYPE,
+      pvfPath: "sqr/fixture/copied.nut",
+      pvfEncoding: "Cn",
+      textContent: "function copied() { return true; }",
+      samePvfCopyProof: {
+        mode: "same-pvf-copy",
+        sourcePvfPath: "sqr/fixture/source.nut",
+        sourceTextSha256: sha256("function copied() { return true; }"),
+      },
+    });
+    checks.push({
+      id: "same-pvf-copy-cannot-bypass-high-risk-new-file-route",
+      ok: highRiskSamePvfCopy.allowed === false && highRiskSamePvfCopy.code === "COPY_FILE_HIGH_RISK_TYPE_BLOCKED",
+    });
+
     const newWorldmapSafety = semanticWriteSafety({
       kind: "write-file",
       pvfPath: "worldmap/AgentAuditCandidate.wdm",
@@ -1052,6 +1342,325 @@ function changeSetAuthorizationSelfTest() {
     checks.push({
       id: "registry-lifecycle-proof-opens-only-specialized-lst-route",
       ok: existingLstWithProof.allowed,
+    });
+
+    const existingNutSource = [
+      "function onStart(appendage)",
+      "{",
+      "\tappendage.sq_AddFunctionName(\"proc\", \"fixture_proc\");",
+      "}",
+      "",
+    ].join("\r\n");
+    const existingNutAddedFunction = [
+      "function fixture_apply_status(obj)",
+      "{",
+      "\tCNSquirrelAppendage.sq_AddChangeStatusAppendageID(obj, obj, 120, CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL, false, 100, 9901);",
+      "}",
+      "",
+    ].join("\r\n");
+    const existingNutProof = {
+      mode: EXISTING_NUT_CONTROLLED_MODE,
+      sourceTextSha256: sha256(existingNutSource),
+      structureCheckRequired: true,
+      temporaryRoundTripRequired: true,
+      runtimeValidationRequired: true,
+      loadChain: [
+        {
+          fromPvfPath: "sqr/character/fixture_load_state.nut",
+          toPvfPath: "sqr/character/fixture/passive_skill_fixture.nut",
+          requiredText: "pushScriptFiles(\"character/fixture/passive_skill_fixture.nut\");",
+        },
+        {
+          fromPvfPath: "sqr/character/fixture/passive_skill_fixture.nut",
+          toPvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+          requiredText: "CNSquirrelAppendage.sq_AppendAppendage(obj, obj, -1, false, \"character/fixture/appendage/ap_fixture.nut\", true);",
+        },
+      ],
+      touchedFunctions: ["fixture_apply_status"],
+      apiSymbols: [
+        { name: "sq_AddChangeStatusAppendageID", kind: "function", targetEvidencePaths: ["sqr/fixture/api.nut"] },
+        { name: "CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL", kind: "constant", targetEvidencePaths: ["sqr/fixture/status.nut"] },
+      ],
+      apidPlan: { namespace: "fixture-status-resistance", ids: [9901], conflictSearchRequired: true },
+    };
+    const existingNutSafety = semanticWriteSafety({
+      kind: "replace-text",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      pvfEncoding: "Cn",
+      previousText: "}\r\n",
+      newText: `}\r\n\r\n${existingNutAddedFunction}`,
+      sourceText: existingNutSource,
+      writeProof: existingNutProof,
+    });
+    checks.push({
+      id: "existing-nut-specialized-proof-enters-controlled-audit",
+      ok: existingNutSafety.allowed === true && existingNutSafety.runtimeValidationRequired === true,
+    });
+    const existingNutFinal = `${existingNutSource}\r\n${existingNutAddedFunction}`;
+    const existingNutTransition = validateExistingNutTextTransition(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      existingNutSource,
+      existingNutFinal,
+      existingNutProof,
+      [{ previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}` }],
+    );
+    checks.push({
+      id: "existing-nut-function-only-ascii-transition-accepted",
+      ok: existingNutTransition.ok && existingNutTransition.addedFunctions.includes("fixture_apply_status") && existingNutTransition.apids.includes(9901),
+    });
+    const duplicateApiProofShape = validateExistingNutWriteProofShape(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      { ...existingNutProof, apiSymbols: [...existingNutProof.apiSymbols, existingNutProof.apiSymbols[0]] },
+    );
+    checks.push({
+      id: "existing-nut-duplicate-api-proof-blocked",
+      ok: !duplicateApiProofShape.ok && duplicateApiProofShape.errors.some((message) => message.includes("apiSymbols contains duplicates")),
+    });
+    const commentOnlyLoadProofShape = validateExistingNutWriteProofShape(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      {
+        ...existingNutProof,
+        loadChain: [{
+          ...existingNutProof.loadChain[0],
+          requiredText: "local unrelated = 1; // pushScriptFiles(\"character/fixture/passive_skill_fixture.nut\");",
+        }, existingNutProof.loadChain[1]],
+      },
+    );
+    checks.push({
+      id: "existing-nut-load-path-hidden-after-executable-comment-prefix-blocked",
+      ok: !commentOnlyLoadProofShape.ok &&
+        commentOnlyLoadProofShape.errors.some((message) => message.includes("executable function-call argument")),
+    });
+    const existingNutBadHash = validateExistingNutTextTransition(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      existingNutSource,
+      existingNutFinal,
+      { ...existingNutProof, sourceTextSha256: "0".repeat(64) },
+      [{ previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}` }],
+    );
+    checks.push({
+      id: "existing-nut-source-text-sha-mismatch-blocked",
+      ok: !existingNutBadHash.ok && existingNutBadHash.errors.some((message) => message.includes("sourceTextSha256")),
+    });
+    const existingNutTopLevelMutation = validateExistingNutTextTransition(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      existingNutSource,
+      `FIXTURE_GLOBAL <- 1;\r\n${existingNutFinal}`,
+      existingNutProof,
+      [{ previousText: "function", newText: "FIXTURE_GLOBAL <- 1;\r\nfunction" }],
+    );
+    checks.push({
+      id: "existing-nut-top-level-mutation-blocked",
+      ok: !existingNutTopLevelMutation.ok && existingNutTopLevelMutation.errors.some((message) => message.includes("non-function top-level")),
+    });
+    const spoofedNutFunction = [
+      "function fixture_apply_status(obj)",
+      "{",
+      "\t// CNSquirrelAppendage.sq_AddChangeStatusAppendageID and CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL are not calls.",
+      "\tlocal apiName = \"sq_AddChangeStatusAppendageID\";",
+      "\tlocal sq_AddChangeStatusAppendageID = 1;",
+      "\tlocal statusName = \"CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL\";",
+      "\tlocal APID_9901 = 1;",
+      "\treturn APID_9901;",
+      "}",
+      "",
+    ].join("\r\n");
+    const spoofedNutTransition = validateExistingNutTextTransition(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      existingNutSource,
+      `${existingNutSource}\r\n${spoofedNutFunction}`,
+      existingNutProof,
+      [{ previousText: "}\r\n", newText: `}\r\n\r\n${spoofedNutFunction}` }],
+    );
+    checks.push({
+      id: "existing-nut-comment-string-api-and-apid-spoof-blocked",
+      ok: !spoofedNutTransition.ok &&
+        spoofedNutTransition.errors.filter((message) => message.includes("declared API/constant is not used")).length === 2 &&
+        spoofedNutTransition.errors.some((message) => message.includes("declared APID is not used by a declared API call")),
+    });
+    const unboundApidFunction = existingNutAddedFunction
+      .replace(", 9901);", ", 1);")
+      .replace("\r\n}", "\r\n\tlocal unusedApid = 9901;\r\n}");
+    const unboundApidTransition = validateExistingNutTextTransition(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      existingNutSource,
+      `${existingNutSource}\r\n${unboundApidFunction}`,
+      existingNutProof,
+      [{ previousText: "}\r\n", newText: `}\r\n\r\n${unboundApidFunction}` }],
+    );
+    checks.push({
+      id: "existing-nut-apid-must-be-an-argument-of-a-declared-api-call",
+      ok: !unboundApidTransition.ok &&
+        unboundApidTransition.errors.some((message) => message.includes("declared APID is not used by a declared API call")),
+    });
+    const existingNutChineseSafety = semanticWriteSafety({
+      kind: "replace-text",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      pvfEncoding: "Cn",
+      previousText: "return true;",
+      newText: "return `中文`;",
+      sourceText: existingNutSource,
+      writeProof: existingNutProof,
+    });
+    checks.push({
+      id: "existing-nut-non-ascii-write-remains-blocked",
+      ok: !existingNutChineseSafety.allowed && existingNutChineseSafety.code === "PROTECTED_FILE_TYPE_WRITE_BLOCKED",
+    });
+    checks.push({
+      id: "existing-co-sqr-str-protection-remains",
+      ok: [".co", ".sqr", ".str"].every((extension) => {
+        const safety = semanticWriteSafety({
+          kind: "replace-text",
+          pvfPath: `sqr/fixture/protected${extension}`,
+          pvfEncoding: "Cn",
+          previousText: "1",
+          newText: "2",
+          sourceText: "1",
+          writeProof: existingNutProof,
+        });
+        return !safety.allowed && ["PROTECTED_FILE_TYPE_WRITE_BLOCKED", "CN_LOCALIZATION_WRITE_UNVERIFIED"].includes(safety.code);
+      }),
+    });
+    const nutAuditFiles = new Map([
+      ["sqr/character/fixture_load_state.nut", existingNutProof.loadChain[0].requiredText],
+      ["sqr/character/fixture/passive_skill_fixture.nut", existingNutProof.loadChain[1].requiredText],
+      ["sqr/fixture/api.nut", "function fixture_api(obj) { CNSquirrelAppendage.sq_AddChangeStatusAppendageID(obj, obj, 1, 1, false, 1, 1); }"],
+      ["sqr/fixture/status.nut", "function fixture_status() { return CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL; }"],
+    ]);
+    const fakeNutAuditClient = (searchItems = []) => ({
+      callTool: async (name, toolArgs) => {
+        if (name === "pvf_read_file") {
+          const textContent = nutAuditFiles.get(normalizePvfPath(toolArgs.pvfPath).toLowerCase());
+          if (typeof textContent !== "string") return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: "fixture path missing" }) }] };
+          return { content: [{ type: "text", text: JSON.stringify({ textContent, metadata: { fixture: true } }) }] };
+        }
+        if (name === "pvf_search") {
+          return { content: [{ type: "text", text: JSON.stringify({ items: searchItems, matchedCount: searchItems.length, returnedCount: searchItems.length, errorCount: 0, truncated: false }) }] };
+        }
+        return { isError: true, content: [{ type: "text", text: JSON.stringify({ error: `unsupported fixture tool ${name}` }) }] };
+      },
+    });
+    const completeNutAudit = await auditExistingNutControlledEdit({
+      client: fakeNutAuditClient(),
+      sessionId: "fixture",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      sourceText: existingNutSource,
+      finalText: existingNutFinal,
+      changes: [{ id: "fixture", previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}`, writeProof: existingNutProof }],
+      changeSet: { target: { pvfReadEncoding: "Cn" } },
+      adapterConfig: { defaults: { pvfReadEncoding: "Cn" } },
+      textCache: new Map(),
+    });
+    checks.push({
+      id: "existing-nut-target-load-api-and-apid-audit-accepted",
+      ok: completeNutAudit.ok && completeNutAudit.loadChainChecks.every((item) => item.exactReferencePresent) && completeNutAudit.apiSymbolChecks.every((item) => item.catalogDeclared && item.targetEvidence.some((entry) => entry.exactSymbolPresent)) && completeNutAudit.apidChecks.every((item) => item.complete && item.collisions.length === 0),
+    });
+    nutAuditFiles.set(
+      "sqr/fixture/api.nut",
+      "function fixture_api() { local sq_AddChangeStatusAppendageID = 1; return sq_AddChangeStatusAppendageID; }",
+    );
+    const nonCallApiEvidenceAudit = await auditExistingNutControlledEdit({
+      client: fakeNutAuditClient(), sessionId: "fixture",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      sourceText: existingNutSource, finalText: existingNutFinal,
+      changes: [{ id: "fixture", previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}`, writeProof: existingNutProof }],
+      changeSet: { target: { pvfReadEncoding: "Cn" } }, adapterConfig: { defaults: { pvfReadEncoding: "Cn" } }, textCache: new Map(),
+    });
+    checks.push({
+      id: "existing-nut-target-function-identifier-without-call-is-not-evidence",
+      ok: !nonCallApiEvidenceAudit.ok && nonCallApiEvidenceAudit.errors.some((message) => message.includes("目标 PVF 证据脚本未观察到")),
+    });
+    nutAuditFiles.set(
+      "sqr/fixture/api.nut",
+      "function ::sq_AddChangeStatusAppendageID(sourceObj, targetObj, time, changeStatus, absolute, value, apid) { return null; }",
+    );
+    const definitionOnlyApiEvidenceAudit = await auditExistingNutControlledEdit({
+      client: fakeNutAuditClient(), sessionId: "fixture",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      sourceText: existingNutSource, finalText: existingNutFinal,
+      changes: [{ id: "fixture", previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}`, writeProof: existingNutProof }],
+      changeSet: { target: { pvfReadEncoding: "Cn" } }, adapterConfig: { defaults: { pvfReadEncoding: "Cn" } }, textCache: new Map(),
+    });
+    checks.push({
+      id: "existing-nut-target-function-definition-without-call-is-not-evidence",
+      ok: !definitionOnlyApiEvidenceAudit.ok && definitionOnlyApiEvidenceAudit.errors.some((message) => message.includes("目标 PVF 证据脚本未观察到")),
+    });
+    nutAuditFiles.set(
+      "sqr/fixture/api.nut",
+      "function fixture_api(obj) { CNSquirrelAppendage.sq_AddChangeStatusAppendageID(obj, obj, 1, 1, false, 1, 1); }",
+    );
+    nutAuditFiles.set(
+      "sqr/character/fixture_load_state.nut",
+      `// ${existingNutProof.loadChain[0].requiredText}\r\nlocal fakeLoad = \`${existingNutProof.loadChain[0].requiredText}\`;`,
+    );
+    const commentedLoadChainAudit = await auditExistingNutControlledEdit({
+      client: fakeNutAuditClient(), sessionId: "fixture",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      sourceText: existingNutSource, finalText: existingNutFinal,
+      changes: [{ id: "fixture", previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}`, writeProof: existingNutProof }],
+      changeSet: { target: { pvfReadEncoding: "Cn" } }, adapterConfig: { defaults: { pvfReadEncoding: "Cn" } }, textCache: new Map(),
+    });
+    checks.push({
+      id: "existing-nut-comment-or-string-load-chain-reference-blocked",
+      ok: !commentedLoadChainAudit.ok && commentedLoadChainAudit.errors.some((message) => message.includes("加载链缺少精确引用")),
+    });
+    nutAuditFiles.set("sqr/character/fixture_load_state.nut", existingNutProof.loadChain[0].requiredText);
+    nutAuditFiles.set("sqr/fixture/status.nut", "function fixture_status() { return \"CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL\"; } // not runtime evidence");
+    const missingTargetApiAudit = await auditExistingNutControlledEdit({
+      client: fakeNutAuditClient(), sessionId: "fixture",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      sourceText: existingNutSource, finalText: existingNutFinal,
+      changes: [{ id: "fixture", previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}`, writeProof: existingNutProof }],
+      changeSet: { target: { pvfReadEncoding: "Cn" } }, adapterConfig: { defaults: { pvfReadEncoding: "Cn" } }, textCache: new Map(),
+    });
+    checks.push({
+      id: "existing-nut-target-api-comment-or-string-evidence-blocked",
+      ok: !missingTargetApiAudit.ok && missingTargetApiAudit.errors.some((message) => message.includes("目标 PVF 证据脚本未观察到")),
+    });
+    nutAuditFiles.set("sqr/fixture/status.nut", "function fixture_status() { return CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL; }");
+    nutAuditFiles.set("sqr/fixture/apid-spoof.nut", "function no_collision() { local APID_9901 = 1; return \"9901\"; } // 9901");
+    const apidSpoofAudit = await auditExistingNutControlledEdit({
+      client: fakeNutAuditClient([{ fileName: "sqr/fixture/apid-spoof.nut" }]), sessionId: "fixture",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      sourceText: existingNutSource, finalText: existingNutFinal,
+      changes: [{ id: "fixture", previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}`, writeProof: existingNutProof }],
+      changeSet: { target: { pvfReadEncoding: "Cn" } }, adapterConfig: { defaults: { pvfReadEncoding: "Cn" } }, textCache: new Map(),
+    });
+    checks.push({
+      id: "existing-nut-apid-comment-string-or-identifier-is-not-a-conflict",
+      ok: apidSpoofAudit.ok && apidSpoofAudit.apidChecks[0]?.collisions?.length === 0,
+    });
+    nutAuditFiles.set("sqr/fixture/apid-collision.nut", "function collision() { return 9901; }");
+    const apidCollisionAudit = await auditExistingNutControlledEdit({
+      client: fakeNutAuditClient([{ fileName: "sqr/fixture/apid-collision.nut" }]), sessionId: "fixture",
+      pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+      sourceText: existingNutSource, finalText: existingNutFinal,
+      changes: [{ id: "fixture", previousText: "}\r\n", newText: `}\r\n\r\n${existingNutAddedFunction}`, writeProof: existingNutProof }],
+      changeSet: { target: { pvfReadEncoding: "Cn" } }, adapterConfig: { defaults: { pvfReadEncoding: "Cn" } }, textCache: new Map(),
+    });
+    checks.push({
+      id: "existing-nut-apid-target-source-conflict-blocked",
+      ok: !apidCollisionAudit.ok && apidCollisionAudit.apidChecks[0]?.collisions?.length === 1,
+    });
+    const duplicateApidPlans = [
+      { existingNutAudit: { ok: true, errors: [], apidChecks: [{ id: 9901 }] } },
+      { existingNutAudit: { ok: true, errors: [], apidChecks: [{ id: 9901 }] } },
+    ];
+    enforceAtomicNutApidUniqueness(duplicateApidPlans);
+    checks.push({
+      id: "existing-nut-apid-conflict-inside-atomic-change-set-blocked",
+      ok: duplicateApidPlans.every((plan) => !plan.existingNutAudit.ok && plan.existingNutAudit.errors.some((message) => message.includes("多个 NUT"))),
+    });
+    const malformedNutTransition = validateExistingNutTextTransition(
+      "sqr/character/fixture/appendage/ap_fixture.nut",
+      existingNutSource,
+      `${existingNutSource}\r\nfunction fixture_apply_status(obj)\r\n{\r\n`,
+      existingNutProof,
+      [{ previousText: "}\r\n", newText: "}\r\nfunction fixture_apply_status(obj)\r\n{\r\n" }],
+    );
+    checks.push({
+      id: "existing-nut-unbalanced-final-script-blocked",
+      ok: !malformedNutTransition.ok && malformedNutTransition.errors.some((message) => message.includes("final:")),
     });
 
     const registryLifecycleProof = {
@@ -1145,6 +1754,54 @@ function changeSetAuthorizationSelfTest() {
         message.includes("NON_ASCII_TEXT_WRITE_UNVERIFIED") && message.includes(VERIFIED_INLINE_TEXT_MODE)),
     });
 
+    const validCopyChangeSet = {
+      ...invalidDirectChineseChangeSet,
+      changes: [{
+        id: "copy-difficulty-table",
+        type: COPY_FILE_CHANGE_TYPE,
+        pvfPath: "dungeon/fixture/monsterapcdifficultybonus_custom.tbl",
+        sourcePvfPath: "monster/monsterapcdifficultybonus.tbl",
+        expectAbsent: true,
+        pvfEncoding: "Cn",
+      }],
+    };
+    checks.push({
+      id: "validate-allows-same-pvf-ordinary-text-copy",
+      ok: validateChangeSet(validCopyChangeSet).length === 0,
+    });
+    checks.push({
+      id: "validate-blocks-copy-and-replace-on-same-target-until-cumulative-round",
+      ok: validateChangeSet({
+        ...validCopyChangeSet,
+        changes: [
+          ...validCopyChangeSet.changes,
+          {
+            id: "premature-copy-edit",
+            type: "replace-text",
+            pvfPath: validCopyChangeSet.changes[0].pvfPath,
+            previousText: "[rate]\r\n1",
+            newText: "[rate]\r\n0.8",
+            pvfEncoding: "Cn",
+          },
+        ],
+      }).some((message) => message.includes("COPY_FILE_TARGET_CONFLICT")),
+    });
+    const decimalRatePlan = planReplacementGroup(
+      "[attack damage rate]\r\n1\r\n[attack speed rate]\r\n1\r\n",
+      [{
+        id: "attack-damage-rate-decimal",
+        type: "replace-text",
+        previousText: "[attack damage rate]\r\n1",
+        newText: "[attack damage rate]\r\n0.8",
+        pvfEncoding: "Cn",
+      }],
+      { pvfPath: "aicharacter/swordman/siran_ghost/siran_ghost.aic", pvfReadEncoding: "Cn", fallbackEncoding: "Cn" },
+    );
+    checks.push({
+      id: "integer-to-decimal-uses-complete-tag-value-selector",
+      ok: decimalRatePlan.blocked === false && decimalRatePlan.items[0]?.occurrenceCount === 1 && decimalRatePlan.expectedText.includes("[attack damage rate]\r\n0.8"),
+    });
+
     const samePathHandoffChangeSet = {
       ...invalidDirectChineseChangeSet,
       changes: [
@@ -1209,6 +1866,19 @@ function changeSetAuthorizationSelfTest() {
         blockedDryRunHandoff.readyForApply === false &&
         blockedDryRunHandoff.nextCommandOnly === null,
     });
+    const clientDeployHandoff = applyAgentHandoff(
+      path.join(tempRoot, "output", "APPLY-MANIFEST.json"),
+      { sourceProfile: "fixture-client" },
+    );
+    checks.push({
+      id: "apply-handoff-routes-profile-output-to-client-preview-without-manual-copy",
+      ok:
+        clientDeployHandoff.clientDeploymentSeparatelyAuthorized === true &&
+        clientDeployHandoff.nextCommandOnly.includes("client-pvf preview") &&
+        clientDeployHandoff.nextCommandOnly.includes("--profile \"fixture-client\"") &&
+        clientDeployHandoff.nextCommandOnly.includes("--apply-manifest") &&
+        clientDeployHandoff.instruction.includes("不要手工复制 PVF"),
+    });
 
     const batchValidationErrors = validateChangeSet({
       ...invalidDirectChineseChangeSet,
@@ -1261,6 +1931,10 @@ function changeSetAuthorizationSelfTest() {
     const inlineWriterSelfTest = verifiedInlineTextSelfTest();
     for (const check of inlineWriterSelfTest.checks) {
       checks.push({ ...check, id: `verified-inline-text-${check.id}` });
+    }
+    const bytePreservingNutSelfTest = bytePreservingAsciiTextSelfTest();
+    for (const check of bytePreservingNutSelfTest.checks) {
+      checks.push({ ...check, id: `existing-nut-${check.id}` });
     }
     const batchStress = verifiedInlineTextBatchStressSelfTest();
     for (const stressCase of batchStress.cases) {
@@ -1709,7 +2383,12 @@ function resolveCumulativeBaseline(changeSet, changeSetFile) {
   ) {
     throw codedError("CUMULATIVE_BASELINE_MANIFEST_UNVERIFIED", "上一轮生成记录未能证明源文件保持不变、输出完整复查且 SHA256 已绑定。");
   }
-  const protectedSourcePvf = path.resolve(manifest.protectedSourcePvf || manifest.sourcePvf);
+  const declaredProtectedSourcePvf = path.resolve(manifest.protectedSourcePvf || manifest.sourcePvf);
+  const protectedSourceOriginPvf = path.resolve(
+    manifest.protectedSourceOriginPvf ||
+      manifest.cumulative?.protectedSourceOriginPvf ||
+      declaredProtectedSourcePvf,
+  );
   const protectedSourcePvfSha256 = String(manifest.protectedSourcePvfSha256 || manifest.sourcePvfSha256 || "").toLowerCase();
   const baselinePvf = path.resolve(manifest.outputPvf || "");
   const baselinePvfSha256 = String(manifest.outputPvfSha256 || "").toLowerCase();
@@ -1731,8 +2410,10 @@ function resolveCumulativeBaseline(changeSet, changeSetFile) {
     const totalCount = Number(manifest.cumulative.totalChangeCount);
     const priorDepth = Number(manifest.cumulative.chainDepth);
     if (
-      !samePath(manifest.cumulative.protectedSourcePvf || "", protectedSourcePvf) ||
+      !samePath(manifest.cumulative.protectedSourcePvf || "", declaredProtectedSourcePvf) ||
       String(manifest.cumulative.protectedSourcePvfSha256 || "").toLowerCase() !== protectedSourcePvfSha256 ||
+      (manifest.cumulative.protectedSourceOriginPvf !== undefined &&
+        !samePath(manifest.cumulative.protectedSourceOriginPvf || "", protectedSourceOriginPvf)) ||
       !samePath(manifest.cumulative.inputPvf || "", manifest.sourcePvf || "") ||
       String(manifest.cumulative.inputPvfSha256 || "").toLowerCase() !== String(manifest.sourcePvfSha256 || "").toLowerCase() ||
       !Number.isSafeInteger(previousCount) || previousCount < 0 ||
@@ -1755,6 +2436,30 @@ function resolveCumulativeBaseline(changeSet, changeSetFile) {
   if (!/^[a-f0-9]{64}$/.test(protectedSourcePvfSha256) || !/^[a-f0-9]{64}$/.test(baselinePvfSha256)) {
     throw codedError("CUMULATIVE_BASELINE_MANIFEST_UNVERIFIED", "上一轮生成记录缺少有效的源/输出 SHA256。");
   }
+  let protectedSourcePvf = declaredProtectedSourcePvf;
+  const recordedBackupPath = manifest.backupPath ? path.resolve(manifest.backupPath) : null;
+  const recordedBackupVerified =
+    manifest.safety?.backupCreated === true &&
+    manifest.safety?.backupContentAddressed === true &&
+    manifest.safety?.backupSha256Verified === true;
+  if (recordedBackupPath && recordedBackupVerified) {
+    if (pathInside(workbenchRoot, recordedBackupPath)) {
+      throw codedError("CUMULATIVE_PROTECTED_SOURCE_UNVERIFIED", "上一轮受保护源备份错误地位于工作台内部。");
+    }
+    if (
+      path.basename(path.dirname(recordedBackupPath)).toLowerCase() !== "sha256" ||
+      path.basename(recordedBackupPath).toLowerCase() !== `${protectedSourcePvfSha256}.script.pvf`
+    ) {
+      throw codedError("CUMULATIVE_PROTECTED_SOURCE_UNVERIFIED", "上一轮受保护源备份路径没有按其 SHA256 命名。");
+    }
+    if (!fs.existsSync(recordedBackupPath) || !fs.statSync(recordedBackupPath).isFile()) {
+      throw codedError("CUMULATIVE_PROTECTED_SOURCE_MISSING", `受保护源备份不存在：${recordedBackupPath}`);
+    }
+    if (sha256File(recordedBackupPath).toLowerCase() !== protectedSourcePvfSha256) {
+      throw codedError("CUMULATIVE_PROTECTED_SOURCE_CHANGED", "受保护源备份 SHA256 不符，不能继续上一轮基线。");
+    }
+    protectedSourcePvf = recordedBackupPath;
+  }
   if (!fs.existsSync(protectedSourcePvf) || !fs.statSync(protectedSourcePvf).isFile()) {
     throw codedError("CUMULATIVE_PROTECTED_SOURCE_MISSING", `受保护源 PVF 不存在：${protectedSourcePvf}`);
   }
@@ -1775,6 +2480,7 @@ function resolveCumulativeBaseline(changeSet, changeSetFile) {
     manifestSha256: sha256File(manifestPath),
     manifest,
     protectedSourcePvf,
+    protectedSourceOriginPvf,
     protectedSourcePvfSha256,
     baselinePvf,
     baselinePvfSha256,
@@ -1792,6 +2498,7 @@ function resolveChangeInput(changeSet, changeSetFile, explicitPvf, requestedProf
     return {
       sourcePvf: resolvedSource.sourcePvf,
       protectedSourcePvf: resolvedSource.sourcePvf,
+      protectedSourceOriginPvf: resolvedSource.sourcePvf,
       resolvedSource,
       cumulative: null,
     };
@@ -1800,17 +2507,25 @@ function resolveChangeInput(changeSet, changeSetFile, explicitPvf, requestedProf
     throw codedError("CUMULATIVE_BASELINE_OVERRIDE_MISMATCH", "--pvf 必须指向上一轮生成记录绑定的输出 PVF；不要绕过累积基线。");
   }
   const profile = requestedProfile ? resolveSourcePvf(workbenchRoot, requestedProfile, null).profile : null;
-  if (profile && !samePath(profile.sourcePvf, cumulative.protectedSourcePvf)) {
+  if (
+    profile &&
+    !samePath(profile.sourcePvf, cumulative.protectedSourcePvf) &&
+    !samePath(profile.sourcePvf, cumulative.protectedSourceOriginPvf)
+  ) {
     throw codedError("CUMULATIVE_PROFILE_SOURCE_MISMATCH", "所选 profile 的受保护源与上一轮生成记录不一致。");
   }
-  if (!samePath(path.resolve(changeSet.target.sourcePvf), cumulative.protectedSourcePvf)) {
+  if (
+    !samePath(path.resolve(changeSet.target.sourcePvf), cumulative.protectedSourcePvf) &&
+    !samePath(path.resolve(changeSet.target.sourcePvf), cumulative.protectedSourceOriginPvf)
+  ) {
     throw codedError("CUMULATIVE_CHANGE_SET_SOURCE_MISMATCH", "change-set target.sourcePvf 必须保持为累积链最初的受保护源 PVF。");
   }
   return {
     sourcePvf: cumulative.baselinePvf,
     protectedSourcePvf: cumulative.protectedSourcePvf,
+    protectedSourceOriginPvf: cumulative.protectedSourceOriginPvf,
     resolvedSource: {
-      sourcePvf: cumulative.protectedSourcePvf,
+      sourcePvf: cumulative.protectedSourceOriginPvf,
       profile,
       source: "baseline.applyManifest",
     },
@@ -1826,6 +2541,7 @@ function cumulativeBaselineBinding(cumulative) {
     inputPvf: cumulative.baselinePvf,
     inputPvfSha256: cumulative.baselinePvfSha256,
     protectedSourcePvf: cumulative.protectedSourcePvf,
+    protectedSourceOriginPvf: cumulative.protectedSourceOriginPvf,
     protectedSourcePvfSha256: cumulative.protectedSourcePvfSha256,
     previousChangeCount: cumulative.previousChangeCount,
     chainDepth: cumulative.chainDepth,
@@ -1894,11 +2610,32 @@ function assertControlledWriteRunnerPolicy(writePolicy) {
     semanticSafety.stringLinkTextWriteAllowed !== false ||
     semanticSafety.cnAndTwRoundTripProbeRequired !== true ||
     semanticSafety.numericOrAsciiMinimalWriteAllowed !== true ||
+    semanticSafety.samePvfOrdinaryTextCopyAllowed !== true ||
+    semanticSafety.samePvfCopyRequiresSameExtension !== true ||
+    semanticSafety.samePvfCopyRequiresAbsentTarget !== true ||
+    semanticSafety.samePvfCopyHighRiskExtensionsAllowed !== false ||
+    semanticSafety.samePvfCopyRoundTripProbeRequired !== true ||
+    semanticSafety.samePvfCopyModificationRequiresCumulativeNextRound !== true ||
     semanticSafety.highRiskNewFileProofRequired !== true ||
     semanticSafety.highRiskNewFileRoundTripProbeRequired !== true ||
     semanticSafety.highRiskFinalIndependentReadbackRequired !== true ||
     semanticSafety.highRiskSameExtensionReferenceRequired !== true ||
     semanticSafety.existingHighRiskFileProtectionRemains !== true ||
+    semanticSafety.existingNutControlledEditRequiresDedicatedProof !== true ||
+    semanticSafety.existingNutAsciiOnly !== true ||
+    semanticSafety.existingNutSourceTextSha256Required !== true ||
+    semanticSafety.existingNutRawBytePreservingPatchRequired !== true ||
+    semanticSafety.existingNutWholeFileReencodingAllowed !== false ||
+    semanticSafety.existingNutNonTargetRawBytesMustRemainIdentical !== true ||
+    semanticSafety.existingNutLoadChainRequired !== true ||
+    semanticSafety.existingNutFunctionApiAndApidAuditRequired !== true ||
+    semanticSafety.existingNutEvidenceMustBeExecutableCode !== true ||
+    semanticSafety.existingNutApidMustBeExactIntegerLiteral !== true ||
+    semanticSafety.existingNutApidMustBeDeclaredApiCallArgument !== true ||
+    semanticSafety.existingNutTemporaryRoundTripRequired !== true ||
+    semanticSafety.existingNutFinalIndependentReadbackRequired !== true ||
+    semanticSafety.existingNutRuntimeValidationRequired !== true ||
+    semanticSafety.existingCoSqrStrProtectionRemains !== true ||
     semanticSafety.registryLifecycleOnlyForExplicitRowAdd !== true ||
     semanticSafety.registryLifecycleExistingTextPreserved !== true ||
     semanticSafety.registryLifecycleTargetClosureRequired !== true ||
@@ -1911,7 +2648,7 @@ function assertControlledWriteRunnerPolicy(writePolicy) {
     throw new Error("Controlled write runner semantic text safety policy is incomplete or unsafe.");
   }
   const allowedBridgeTools = new Set(runner.allowedBridgeTools || []);
-  for (const tool of ["pvf_open", "pvf_list_files", "pvf_read_file", "pvf_replace_text", "pvf_apply_text_plan", "pvf_apply_verified_text_plan", "pvf_write_file", "pvf_save", "pvf_close"]) {
+  for (const tool of ["pvf_open", "pvf_list_files", "pvf_search", "pvf_read_file", "pvf_replace_text", "pvf_apply_text_plan", "pvf_apply_verified_text_plan", "pvf_write_file", "pvf_save", "pvf_close"]) {
     if (!allowedBridgeTools.has(tool)) {
       throw new Error(`controlledWriteRunner.allowedBridgeTools is missing required tool: ${tool}`);
     }
@@ -2020,6 +2757,13 @@ function validateChangeSet(changeSet) {
         prefix,
         errors,
       );
+    } else if (change.type === COPY_FILE_CHANGE_TYPE) {
+      reportUnsupportedFields(
+        change,
+        [...commonChangeFields, "sourcePvfPath", "expectAbsent", "compileScript"],
+        prefix,
+        errors,
+      );
     } else {
       reportUnsupportedFields(change, commonChangeFields, prefix, errors);
     }
@@ -2124,28 +2868,47 @@ function validateChangeSet(changeSet) {
       if (change.writeProof !== undefined) {
         reportUnsupportedFields(
           change.writeProof,
-          ["mode", "allowExistingRegistryEdit", "registry", "pairedEntries", "referencePaths", "compileRequired", "encodingRoundTripRequired", "pvfEncoding", "sourceTextSha256", "crossVersionEvidence"],
+          ["mode", "allowExistingRegistryEdit", "registry", "pairedEntries", "referencePaths", "compileRequired", "encodingRoundTripRequired", "pvfEncoding", "sourceTextSha256", "crossVersionEvidence", "structureCheckRequired", "temporaryRoundTripRequired", "runtimeValidationRequired", "loadChain", "touchedFunctions", "apiSymbols", "apidPlan"],
           `${prefix}.writeProof`,
           errors,
         );
-        if (change.writeProof?.mode !== "registry-lifecycle") {
-          errors.push(`${prefix}.writeProof.mode is only allowed as registry-lifecycle on replace-text changes.`);
-        }
-        if (!change.pvfPath.toLowerCase().replace(/\\/g, "/").endsWith(".lst")) {
-          errors.push(`${prefix}.writeProof registry-lifecycle requires a .lst pvfPath.`);
-        }
-        if (change.writeProof?.allowExistingRegistryEdit !== true) {
-          errors.push(`${prefix}.writeProof.allowExistingRegistryEdit must be true for a controlled registry row change.`);
-        }
-        if (!change.writeProof?.registry || typeof change.writeProof.registry !== "object") {
-          errors.push(`${prefix}.writeProof.registry is required for a controlled registry row change.`);
-        } else {
-          if (change.writeProof.registry.action !== "add") errors.push(`${prefix}.writeProof.registry.action must be add for an existing .lst.`);
-          if (!Number.isSafeInteger(change.writeProof.registry.id) || change.writeProof.registry.id < 0) errors.push(`${prefix}.writeProof.registry.id must be a non-negative integer.`);
-          if (typeof change.writeProof.registry.expectedPvfPath !== "string" || !change.writeProof.registry.expectedPvfPath.trim()) errors.push(`${prefix}.writeProof.registry.expectedPvfPath is required.`);
-          if (normalizePvfPath(change.writeProof.registry.lstPath).toLowerCase() !== normalizePvfPath(change.pvfPath).toLowerCase()) {
-            errors.push(`${prefix}.writeProof.registry.lstPath must match pvfPath for an existing .lst.`);
+        if (change.writeProof?.mode === "registry-lifecycle") {
+          if (!String(change.pvfPath || "").toLowerCase().replace(/\\/g, "/").endsWith(".lst")) {
+            errors.push(`${prefix}.writeProof registry-lifecycle requires a .lst pvfPath.`);
           }
+          if (change.writeProof?.allowExistingRegistryEdit !== true) {
+            errors.push(`${prefix}.writeProof.allowExistingRegistryEdit must be true for a controlled registry row change.`);
+          }
+          if (!change.writeProof?.registry || typeof change.writeProof.registry !== "object") {
+            errors.push(`${prefix}.writeProof.registry is required for a controlled registry row change.`);
+          } else {
+            reportUnsupportedFields(change.writeProof.registry, ["lstPath", "id", "expectedPvfPath", "action"], `${prefix}.writeProof.registry`, errors);
+            if (change.writeProof.registry.action !== "add") errors.push(`${prefix}.writeProof.registry.action must be add for an existing .lst.`);
+            if (!Number.isSafeInteger(change.writeProof.registry.id) || change.writeProof.registry.id < 0) errors.push(`${prefix}.writeProof.registry.id must be a non-negative integer.`);
+            if (typeof change.writeProof.registry.expectedPvfPath !== "string" || !change.writeProof.registry.expectedPvfPath.trim()) errors.push(`${prefix}.writeProof.registry.expectedPvfPath is required.`);
+            if (normalizePvfPath(change.writeProof.registry.lstPath).toLowerCase() !== normalizePvfPath(change.pvfPath).toLowerCase()) {
+              errors.push(`${prefix}.writeProof.registry.lstPath must match pvfPath for an existing .lst.`);
+            }
+          }
+        } else if (change.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE) {
+          const proofShape = validateExistingNutWriteProofShape(change.pvfPath, change.writeProof);
+          for (const message of proofShape.errors) errors.push(`[EXISTING_NUT_WRITE_PROOF_REQUIRED] ${prefix}: ${message}`);
+          const existingNutEncoding = change.pvfEncoding || changeSet.target?.pvfReadEncoding;
+          if (!new Set(["Cn", "Tw", "Utf8"]).has(existingNutEncoding)) {
+            errors.push(`${prefix}.pvfEncoding (or target.pvfReadEncoding) must be Cn, Tw or Utf8 for an existing NUT controlled edit.`);
+          }
+          if (change.textWriteMode !== undefined) errors.push(`${prefix}.textWriteMode is not allowed for an existing NUT controlled edit.`);
+          for (const [linkIndex, link] of (Array.isArray(change.writeProof.loadChain) ? change.writeProof.loadChain : []).entries()) {
+            reportUnsupportedFields(link, ["fromPvfPath", "toPvfPath", "requiredText"], `${prefix}.writeProof.loadChain[${linkIndex}]`, errors);
+          }
+          for (const [symbolIndex, symbol] of (Array.isArray(change.writeProof.apiSymbols) ? change.writeProof.apiSymbols : []).entries()) {
+            reportUnsupportedFields(symbol, ["name", "kind", "targetEvidencePaths"], `${prefix}.writeProof.apiSymbols[${symbolIndex}]`, errors);
+          }
+          if (change.writeProof.apidPlan && typeof change.writeProof.apidPlan === "object" && !Array.isArray(change.writeProof.apidPlan)) {
+            reportUnsupportedFields(change.writeProof.apidPlan, ["namespace", "ids", "conflictSearchRequired"], `${prefix}.writeProof.apidPlan`, errors);
+          }
+        } else {
+          errors.push(`${prefix}.writeProof.mode is only allowed as registry-lifecycle or ${EXISTING_NUT_CONTROLLED_MODE} on replace-text changes.`);
         }
       }
     } else if (change.type === "write-file") {
@@ -2180,8 +2943,32 @@ function validateChangeSet(changeSet) {
       } else if (change.writeProof !== undefined) {
         errors.push(`${prefix}.writeProof is only supported for audited high-risk new files or registry lifecycle changes.`);
       }
+    } else if (change.type === COPY_FILE_CHANGE_TYPE) {
+      if (typeof change.sourcePvfPath !== "string" || !change.sourcePvfPath.trim()) {
+        errors.push(`${prefix}.sourcePvfPath is required.`);
+      }
+      if (change.expectAbsent !== true) {
+        errors.push(`${prefix}.expectAbsent must be true; controlled copy-file cannot overwrite an existing PVF path.`);
+      }
+      if (change.compileScript !== undefined && typeof change.compileScript !== "boolean") {
+        errors.push(`${prefix}.compileScript must be boolean when present.`);
+      }
+      const sourcePvfPath = normalizePvfPath(change.sourcePvfPath);
+      const targetPvfPath = normalizePvfPath(change.pvfPath);
+      if (sourcePvfPath && targetPvfPath && sourcePvfPath.toLowerCase() === targetPvfPath.toLowerCase()) {
+        errors.push(`${prefix}.sourcePvfPath must differ from pvfPath.`);
+      }
+      if (sourcePvfPath && targetPvfPath && extensionOf(sourcePvfPath) !== extensionOf(targetPvfPath)) {
+        errors.push(`${prefix}.sourcePvfPath and pvfPath must use the same file extension.`);
+      }
+      if (HIGH_RISK_NEW_FILE_MODES[extensionOf(targetPvfPath)]) {
+        errors.push(`[COPY_FILE_HIGH_RISK_TYPE_BLOCKED] ${prefix} cannot copy a protected high-risk file type; use the dedicated writeProof route.`);
+      }
+      if (change.writeProof !== undefined) {
+        errors.push(`${prefix}.writeProof is not supported for copy-file.`);
+      }
     } else {
-      errors.push(`${prefix}.type must be replace-text or write-file.`);
+      errors.push(`${prefix}.type must be replace-text, write-file or ${COPY_FILE_CHANGE_TYPE}.`);
     }
     if (change.requiredResolvedIds !== undefined) {
       if (!Array.isArray(change.requiredResolvedIds)) {
@@ -2199,6 +2986,28 @@ function validateChangeSet(changeSet) {
           if (typeof required.expectedPvfPath !== "string") errors.push(`${requiredPrefix}.expectedPvfPath must be a string.`);
         }
       }
+    }
+  }
+  for (const group of groupChangesByPvfPath(Array.isArray(changeSet.changes) ? changeSet.changes : [])) {
+    const copyChanges = group.changes.filter((item) => item?.type === COPY_FILE_CHANGE_TYPE);
+    const writeChanges = group.changes.filter((item) => item?.type === "write-file");
+    const groupedReplaceChanges = group.changes.filter((item) => item?.type === "replace-text");
+    if (copyChanges.length > 1) {
+      errors.push(`[COPY_FILE_TARGET_CONFLICT] Only one copy-file change is allowed for ${group.pvfPath}.`);
+    }
+    if (copyChanges.length && (writeChanges.length || groupedReplaceChanges.length)) {
+      errors.push(`[COPY_FILE_TARGET_CONFLICT] copy-file cannot be mixed with write-file or replace-text for ${group.pvfPath}; modify the clone in a cumulative next round.`);
+    }
+    const replaceChanges = group.changes.filter((item) => item?.type === "replace-text");
+    const existingNutChanges = replaceChanges.filter((item) => item?.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE);
+    if (!existingNutChanges.length) continue;
+    if (existingNutChanges.length !== replaceChanges.length) {
+      errors.push(`[EXISTING_NUT_PROOF_MISMATCH] Every replace-text change for ${group.pvfPath} must carry the same ${EXISTING_NUT_CONTROLLED_MODE} writeProof.`);
+      continue;
+    }
+    const expectedProofSha256 = canonicalJsonSha256(existingNutChanges[0].writeProof);
+    if (existingNutChanges.some((item) => canonicalJsonSha256(item.writeProof) !== expectedProofSha256)) {
+      errors.push(`[EXISTING_NUT_PROOF_MISMATCH] All changes for ${group.pvfPath} must carry an identical existing NUT writeProof.`);
     }
   }
   return errors;
@@ -2222,6 +3031,49 @@ function readVerifiedSourceFile(changeSetFile, change) {
   }
   const textContent = raw.toString("utf8").replace(/^\uFEFF/, "");
   return { sourceFile, raw, textContent, actualSha256 };
+}
+
+async function readVerifiedPvfCopySource(client, sessionId, changeSet, change, adapterConfig) {
+  const sourcePvfPath = normalizePvfPath(change.sourcePvfPath);
+  const targetPvfPath = normalizePvfPath(change.pvfPath);
+  if (!sourcePvfPath || sourcePvfPath.toLowerCase() === targetPvfPath.toLowerCase()) {
+    throw codedError("COPY_FILE_SOURCE_INVALID", "copy-file 的源路径必须存在且与目标路径不同。");
+  }
+  if (extensionOf(sourcePvfPath) !== extensionOf(targetPvfPath)) {
+    throw codedError("COPY_FILE_EXTENSION_MISMATCH", "copy-file 只允许同扩展名复制。");
+  }
+  if (HIGH_RISK_NEW_FILE_MODES[extensionOf(targetPvfPath)]) {
+    throw codedError("COPY_FILE_HIGH_RISK_TYPE_BLOCKED", "copy-file 不能绕过高风险新增文件的专用 writeProof 流程。");
+  }
+  const pvfEncoding = change.pvfEncoding || changeSet.target.pvfReadEncoding || adapterConfig.defaults.pvfReadEncoding;
+  const read = await callAndParse(client, "pvf_read_file", {
+    sessionId,
+    pvfPath: sourcePvfPath,
+    pvfEncoding,
+    convertToSimplifiedChinese: false,
+    autoConvertStringLink: false,
+    semanticVerificationRead: true,
+    maxChars: 0,
+  });
+  if (typeof read.textContent !== "string") {
+    throw codedError("COPY_FILE_SOURCE_NOT_TEXT", `copy-file 源文件无法作为完整文本读取：${sourcePvfPath}`);
+  }
+  const textContent = read.textContent;
+  const sourceTextSha256 = sha256(textContent);
+  return {
+    sourcePvfPath,
+    textContent,
+    raw: Buffer.from(textContent, "utf8"),
+    sourceTextSha256,
+    actualSha256: sourceTextSha256,
+    metadata: read.metadata || null,
+    semanticReadGuard: read.semanticReadGuard || null,
+    samePvfCopyProof: {
+      mode: "same-pvf-copy",
+      sourcePvfPath,
+      sourceTextSha256,
+    },
+  };
 }
 
 async function pvfPathExists(client, sessionId, pvfPath, directoryCache) {
@@ -2641,6 +3493,7 @@ async function applyFilePlansCoherently({
         dryRun: false,
         pvfPath: plan.pvfPath,
         writeResult: applied?.results?.find((entry) => entry.id === item.change.id) || null,
+        existingNutTransition: applied?.existingNutTransition || null,
         semanticReadGuard: applied?.semanticReadGuard || null,
       });
     }
@@ -2893,6 +3746,215 @@ async function readTargetTextForAudit(client, sessionId, pvfPath, encoding, requ
   }
 }
 
+let builtinNutApiCatalogCache = null;
+
+function loadBuiltinNutApiCatalog() {
+  if (builtinNutApiCatalogCache) return builtinNutApiCatalogCache;
+  const file = path.join(workbenchRoot, "knowledge-pack", "indexes", "nut-api-facts.compact.json");
+  const catalog = readJson(file);
+  if (catalog.phase !== "builtin-nut-api-facts" || !Array.isArray(catalog.declarations)) {
+    throw codedError("NUT_API_CATALOG_INVALID", "内置 NUT API 事实目录不可用，既有 NUT 修改保持阻断。");
+  }
+  builtinNutApiCatalogCache = { file, sha256: sha256File(file), declarations: catalog.declarations };
+  return builtinNutApiCatalogCache;
+}
+
+async function cachedNutAuditText(client, sessionId, pvfPath, encoding, cache) {
+  const normalized = normalizePvfPath(pvfPath);
+  const key = normalized.toLowerCase();
+  if (!cache.has(key)) {
+    const read = await readTargetTextForAudit(client, sessionId, normalized, encoding, true);
+    cache.set(key, { pvfPath: normalized, text: read.text });
+  }
+  return cache.get(key);
+}
+
+async function auditExistingNutControlledEdit({
+  client,
+  sessionId,
+  pvfPath,
+  sourceText,
+  finalText,
+  changes,
+  changeSet,
+  adapterConfig,
+  textCache,
+}) {
+  const normalizedTarget = normalizePvfPath(pvfPath);
+  const errors = [];
+  const warnings = [];
+  const proof = changes[0]?.writeProof || null;
+  const proofSha256 = proof ? canonicalJsonSha256(proof) : null;
+  for (const change of changes) {
+    if (change.writeProof?.mode !== EXISTING_NUT_CONTROLLED_MODE || canonicalJsonSha256(change.writeProof) !== proofSha256) {
+      errors.push("同一既有 NUT 的所有改动必须携带完全一致的专用 writeProof");
+    }
+  }
+  const transition = validateExistingNutTextTransition(normalizedTarget, sourceText, finalText, proof, changes);
+  if (!transition.ok) errors.push(...transition.errors);
+  const encoding = changes[0]?.pvfEncoding || changeSet.target.pvfReadEncoding || adapterConfig.defaults.pvfReadEncoding;
+  const loadChainChecks = [];
+  for (const link of Array.isArray(proof?.loadChain) ? proof.loadChain : []) {
+    try {
+      const source = await cachedNutAuditText(client, sessionId, link.fromPvfPath, encoding, textCache);
+      const exactReferencePresent = containsExecutableFragment(source.text, link.requiredText);
+      loadChainChecks.push({
+        fromPvfPath: normalizePvfPath(link.fromPvfPath),
+        toPvfPath: normalizePvfPath(link.toPvfPath),
+        requiredTextSha256: sha256(link.requiredText),
+        sourceTextSha256: sha256(source.text),
+        exactReferencePresent,
+      });
+      if (!exactReferencePresent) errors.push(`加载链缺少精确引用：${link.fromPvfPath} -> ${link.toPvfPath}`);
+    } catch (error) {
+      loadChainChecks.push({
+        fromPvfPath: normalizePvfPath(link?.fromPvfPath),
+        toPvfPath: normalizePvfPath(link?.toPvfPath),
+        exactReferencePresent: false,
+        error: error.message,
+      });
+      errors.push(`加载链文件无法读取：${link?.fromPvfPath}`);
+    }
+  }
+
+  let catalog = null;
+  try {
+    catalog = loadBuiltinNutApiCatalog();
+  } catch (error) {
+    errors.push(error.message);
+  }
+  const apiSymbolChecks = [];
+  for (const symbol of Array.isArray(proof?.apiSymbols) ? proof.apiSymbols : []) {
+    const catalogMatches = catalog
+      ? catalog.declarations.filter((item) =>
+        item.group === "dnf" &&
+        item.kind === symbol.kind &&
+        [item.name, item.qualifiedName].some((name) => String(name || "") === String(symbol.name || "")))
+      : [];
+    if (catalogMatches.length === 0) errors.push(`内置 DNF NUT API 事实目录未精确声明：${symbol.kind} ${symbol.name}`);
+    const evidence = [];
+    for (const evidencePath of Array.isArray(symbol.targetEvidencePaths) ? symbol.targetEvidencePaths : []) {
+      try {
+        const target = await cachedNutAuditText(client, sessionId, evidencePath, encoding, textCache);
+        const exactSymbolPresent = symbol.kind === "function"
+          ? containsExactFunctionCall(target.text, symbol.name)
+          : containsExactIdentifier(target.text, symbol.name);
+        evidence.push({ pvfPath: target.pvfPath, textSha256: sha256(target.text), exactSymbolPresent });
+      } catch (error) {
+        evidence.push({ pvfPath: normalizePvfPath(evidencePath), exactSymbolPresent: false, error: error.message });
+      }
+    }
+    if (!evidence.some((item) => item.exactSymbolPresent)) errors.push(`目标 PVF 证据脚本未观察到精确符号：${symbol.name}`);
+    apiSymbolChecks.push({
+      name: symbol.name,
+      kind: symbol.kind,
+      catalogDeclared: catalogMatches.length > 0,
+      catalogQualifiedNames: [...new Set(catalogMatches.map((item) => item.qualifiedName))],
+      finalTargetUsesSymbol: symbol.kind === "function"
+        ? containsExactFunctionCall(finalText, symbol.name)
+        : containsExactIdentifier(finalText, symbol.name),
+      targetEvidence: evidence,
+    });
+  }
+
+  const apidChecks = [];
+  for (const id of Array.isArray(proof?.apidPlan?.ids) ? proof.apidPlan.ids : []) {
+    try {
+      const search = await callAndParse(client, "pvf_search", {
+        sessionId,
+        keyword: String(id),
+        searchPath: "sqr",
+        isStartMatch: false,
+        isUseLikeSearchPath: false,
+        searchType: "SearchScript",
+        matchMode: "Like",
+        pvfEncoding: encoding,
+        convertToSimplifiedChinese: false,
+        limit: 2000,
+      });
+      const returned = Array.isArray(search.items) ? search.items : [];
+      const matchedCount = Number(search.matchedCount ?? returned.length);
+      const incomplete = search.truncated === true || matchedCount > returned.length || Number(search.errorCount || 0) > 0;
+      const collisions = [];
+      for (const item of returned) {
+        const candidatePath = normalizePvfPath(item.fileName || item.pvfPath);
+        if (!candidatePath) continue;
+        try {
+          const candidate = await cachedNutAuditText(client, sessionId, candidatePath, encoding, textCache);
+          if (containsExactInteger(candidate.text, id)) collisions.push({ pvfPath: candidate.pvfPath, textSha256: sha256(candidate.text) });
+        } catch (error) {
+          errors.push(`APID ${id} 的候选冲突文件无法读回：${candidatePath}`);
+        }
+      }
+      if (incomplete) errors.push(`APID ${id} 的目标 PVF 冲突搜索不完整`);
+      if (collisions.length > 0) errors.push(`APID ${id} 已在目标 PVF 源脚本中出现`);
+      apidChecks.push({
+        id,
+        namespace: proof.apidPlan.namespace,
+        searchPath: "sqr",
+        matchedCount,
+        returnedCount: returned.length,
+        errorCount: Number(search.errorCount || 0),
+        complete: !incomplete,
+        collisions,
+        finalTargetContainsId: (Array.isArray(proof?.apiSymbols) ? proof.apiSymbols : [])
+          .filter((symbol) => symbol?.kind === "function")
+          .some((symbol) => containsExactIntegerInFunctionCall(finalText, symbol.name, id)),
+      });
+    } catch (error) {
+      errors.push(`APID ${id} 冲突搜索失败：${error.message}`);
+      apidChecks.push({ id, namespace: proof?.apidPlan?.namespace || null, complete: false, collisions: [], error: error.message });
+    }
+  }
+  return {
+    ok: errors.length === 0,
+    mode: EXISTING_NUT_CONTROLLED_MODE,
+    errors: [...new Set(errors)],
+    warnings,
+    pvfPath: normalizedTarget,
+    proofSha256,
+    transition,
+    loadChainChecks,
+    apiCatalog: catalog ? { path: "knowledge-pack/indexes/nut-api-facts.compact.json", sha256: catalog.sha256, targetRuntimeVerified: false } : null,
+    apiSymbolChecks,
+    apidNamespace: proof?.apidPlan?.namespace || null,
+    apidChecks,
+    staticChecksProveRuntimeBehavior: false,
+    runtimeValidationRequired: proof?.runtimeValidationRequired === true,
+    temporaryRoundTripRequired: proof?.temporaryRoundTripRequired === true,
+  };
+}
+
+function enforceAtomicNutApidUniqueness(plans) {
+  const claims = new Map();
+  for (const plan of plans) {
+    for (const check of plan.existingNutAudit?.apidChecks || []) {
+      if (!claims.has(check.id)) claims.set(check.id, []);
+      claims.get(check.id).push(plan);
+    }
+  }
+  for (const [id, owners] of claims) {
+    if (owners.length < 2) continue;
+    for (const plan of owners) {
+      plan.existingNutAudit.errors.push(`APID ${id} 在同一原子 change-set 的多个 NUT 中重复声明`);
+      plan.existingNutAudit.errors = [...new Set(plan.existingNutAudit.errors)];
+      plan.existingNutAudit.ok = false;
+    }
+  }
+}
+
+function blockPlanFromExistingNutAudit(plan) {
+  if (plan.existingNutAudit?.ok === true) return;
+  plan.blocked = true;
+  for (const item of plan.items) {
+    item.applicable = false;
+    item.changed = false;
+    item.blockCode = "EXISTING_NUT_AUDIT_FAILED";
+    item.blockReason = (plan.existingNutAudit?.errors || ["既有 NUT 专用审计未通过。"]).join("；");
+    item.blockDetails = plan.existingNutAudit || null;
+  }
+}
+
 function plannedTextForAudit(pvfPath, pendingWrites, plannedTexts) {
   const key = normalizePvfPath(pvfPath).toLowerCase();
   return plannedTexts.get(key) || pendingWrites.get(key)?.source?.textContent || null;
@@ -3111,6 +4173,7 @@ async function runNewFileRoundTripProbe({
         compileBinaryAni: false,
         convertToTraditionalChinese: false,
         writeProof: change.writeProof,
+        samePvfCopyProof: change.type === COPY_FILE_CHANGE_TYPE ? item.source.samePvfCopyProof : undefined,
       });
       probeResults.push({ id: change.id, write });
     }
@@ -3145,13 +4208,20 @@ async function runNewFileRoundTripProbe({
       const ok = comparison.ok === true && independentSemanticRead && sourceSha256Before === sha256File(sourcePvf);
       outcomes.set(change.id, {
         ok,
-        code: ok ? null : "HIGH_RISK_NEW_FILE_ROUNDTRIP_FAILED",
-        reason: ok ? "新增文件已通过格式/脚本结构、临时写出或编码往返和独立读回。" : "新增文件临时输出读回与源文本不一致。",
+        code: ok ? null : (change.type === COPY_FILE_CHANGE_TYPE ? "COPY_FILE_ROUNDTRIP_FAILED" : "HIGH_RISK_NEW_FILE_ROUNDTRIP_FAILED"),
+        reason: ok
+          ? (change.type === COPY_FILE_CHANGE_TYPE
+            ? "同一 PVF 文件复制已通过临时写出和独立读回。"
+            : "新增文件已通过格式/脚本结构、临时写出或编码往返和独立读回。")
+          : (change.type === COPY_FILE_CHANGE_TYPE
+            ? "同一 PVF 文件复制的临时输出读回与源文本不一致。"
+            : "新增文件临时输出读回与源文本不一致。"),
         comparison,
         independentSemanticRead,
         semanticReadGuard: readback.semanticReadGuard || null,
         outputPvfSha256: fs.existsSync(outputPvf) ? sha256File(outputPvf) : null,
         sourcePvfSha256: sourceSha256Before,
+        sourceUnchanged: sourceSha256Before === sha256File(sourcePvf),
         temporaryOutputRetained: false,
         probeWrite: probeResults.find((entry) => entry.id === change.id)?.write || null,
       });
@@ -3159,7 +4229,7 @@ async function runNewFileRoundTripProbe({
   } catch (error) {
     for (const item of newFiles) outcomes.set(item.change.id, {
       ok: false,
-      code: error.code || "HIGH_RISK_NEW_FILE_ROUNDTRIP_FAILED",
+      code: error.code || (item.change.type === COPY_FILE_CHANGE_TYPE ? "COPY_FILE_ROUNDTRIP_FAILED" : "HIGH_RISK_NEW_FILE_ROUNDTRIP_FAILED"),
       reason: error.message,
       sourcePvfSha256: sourceSha256Before,
       temporaryOutputRetained: false,
@@ -3169,6 +4239,148 @@ async function runNewFileRoundTripProbe({
     if (sourceSessionId) try { await callAndParse(client, "pvf_close", { sessionId: sourceSessionId }); } catch { /* preserve result */ }
     client.stop();
     if (!pathInside(probeBase, probeRoot)) throw new Error(`Unsafe new-file probe path: ${probeRoot}`);
+    fs.rmSync(probeRoot, { recursive: true, force: true });
+  }
+  return outcomes;
+}
+
+async function runExistingNutRoundTripProbe({
+  sourcePvf,
+  changeSet,
+  adapterConfig,
+  writePolicy,
+  filePlans,
+}) {
+  const outcomes = new Map();
+  if (!filePlans.length) return outcomes;
+  const probeBase = path.join(os.tmpdir(), "pvf-workbench-existing-nut-probes");
+  const probeRoot = path.join(probeBase, `${timestamp()}-${crypto.randomUUID()}`);
+  const outputPvf = path.join(probeRoot, "Script.pvf");
+  fs.mkdirSync(probeRoot, { recursive: true });
+  const sourceSha256Before = sha256File(sourcePvf);
+  const client = new BackendStdioClient(controlledWriteLaunchOptions(adapterConfig, writePolicy));
+  let sourceSessionId = null;
+  let outputSessionId = null;
+  const expectedRawByPath = new Map();
+  try {
+    const opened = await callAndParse(client, "pvf_open", {
+      path: sourcePvf,
+      encoding: changeSet.target.pvfOpenEncoding || adapterConfig.defaults.pvfOpenEncoding,
+    });
+    sourceSessionId = opened.session?.sessionId;
+    if (!sourceSessionId) throw new Error("existing-NUT probe pvf_open did not return a sessionId.");
+    if (opened.session?.readOnly === true) {
+      throw Object.assign(new Error("既有 NUT 的临时独立 PVF 往返验证需要 native 写入环境。"), { code: "READ_ONLY_FALLBACK" });
+    }
+    const coordinated = await applyFilePlansCoherently({
+      client,
+      sessionId: sourceSessionId,
+      filePlans,
+      changeSet,
+      adapterConfig,
+    });
+    sourceSessionId = coordinated.sessionId;
+    for (const plan of coordinated.coordinatedPlans) {
+      const planRawHashes = new Set();
+      for (const item of plan.items.filter((candidate) => candidate.changed)) {
+        const applied = coordinated.ordinaryResults.get(item.change.id);
+        if (applied?.ok !== true || applied?.existingNutTransition?.ok !== true) {
+          throw codedError("EXISTING_NUT_TEMPORARY_APPLY_FAILED", `既有 NUT ${item.change.id} 未通过临时最终文本写入审计。`);
+        }
+        if (!/^[a-f0-9]{64}$/iu.test(String(applied?.writeResult?.outputRawSha256 || ""))) {
+          throw codedError("EXISTING_NUT_TEMPORARY_RAW_PROOF_MISSING", `既有 NUT ${item.change.id} 缺少临时原始字节输出哈希。`);
+        }
+        planRawHashes.add(String(applied.writeResult.outputRawSha256).toLowerCase());
+      }
+      if (planRawHashes.size !== 1) {
+        throw codedError("EXISTING_NUT_TEMPORARY_RAW_PROOF_MISMATCH", `既有 NUT ${plan.pvfPath} 的临时原始字节计划不一致。`);
+      }
+      expectedRawByPath.set(normalizePvfPath(plan.pvfPath).toLowerCase(), [...planRawHashes][0]);
+    }
+    await callAndParse(client, "pvf_save", { sessionId: sourceSessionId, targetPath: outputPvf, allowOverwriteSource: false });
+    await callAndParse(client, "pvf_close", { sessionId: sourceSessionId });
+    sourceSessionId = null;
+    const reopened = await callAndParse(client, "pvf_open", {
+      path: outputPvf,
+      encoding: changeSet.target.pvfOpenEncoding || adapterConfig.defaults.pvfOpenEncoding,
+    });
+    outputSessionId = reopened.session?.sessionId;
+    if (!outputSessionId) throw new Error("existing-NUT probe readback pvf_open did not return a sessionId.");
+    for (const plan of filePlans) {
+      const firstChange = plan.items[0]?.change || {};
+      const encoding = firstChange.pvfEncoding || changeSet.target.pvfReadEncoding || adapterConfig.defaults.pvfReadEncoding;
+      const readback = await callAndParse(client, "pvf_read_file", {
+        sessionId: outputSessionId,
+        pvfPath: plan.pvfPath,
+        pvfEncoding: encoding,
+        convertToSimplifiedChinese: false,
+        autoConvertStringLink: false,
+        semanticVerificationRead: true,
+        maxChars: 0,
+      });
+      const comparison = pvfTextReadbackResult(plan.expectedText, readback.textContent);
+      const rawReadback = await callAndParse(client, "pvf_read_file", {
+        sessionId: outputSessionId,
+        pvfPath: plan.pvfPath,
+        pvfEncoding: encoding,
+        semanticVerificationRead: true,
+        rawSha256Only: true,
+      });
+      const expectedOutputRawSha256 = expectedRawByPath.get(normalizePvfPath(plan.pvfPath).toLowerCase()) || null;
+      const actualOutputRawSha256 = String(rawReadback.rawContentSha256 || "").toLowerCase() || null;
+      const rawByteReadbackOk = Boolean(expectedOutputRawSha256) && actualOutputRawSha256 === expectedOutputRawSha256;
+      const independentSemanticRead = readback.semanticReadGuard?.applied === true &&
+        readback.semanticReadGuard?.reason === "verified-text-readback" &&
+        readback.semanticReadGuard?.backend === "typescript-readonly-fallback" &&
+        readback.semanticReadGuard?.selectedEncoding === encoding;
+      const sourceUnchanged = sourceSha256Before === sha256File(sourcePvf);
+      const independentRawRead = rawReadback.semanticReadGuard?.applied === true &&
+        rawReadback.semanticReadGuard?.reason === "verified-text-readback" &&
+        rawReadback.semanticReadGuard?.backend === "typescript-readonly-fallback" &&
+        rawReadback.semanticReadGuard?.selectedEncoding === encoding;
+      const ok = comparison.ok === true && independentSemanticRead && independentRawRead && rawByteReadbackOk && sourceUnchanged;
+      const shared = {
+        ok,
+        code: ok ? null : "EXISTING_NUT_ROUNDTRIP_FAILED",
+        reason: ok
+          ? "既有 NUT 已通过临时独立 PVF 写出、重新打开和 TypeScript 独立读回；这不替代实机行为验证。"
+          : "既有 NUT 临时独立 PVF 的最终文本或独立读回不一致。",
+        pvfPath: plan.pvfPath,
+        comparison,
+        independentSemanticRead,
+        independentRawRead,
+        rawByteReadbackOk,
+        expectedOutputRawSha256,
+        actualOutputRawSha256,
+        rawContentBytes: rawReadback.rawContentBytes ?? null,
+        rawSemanticReadGuard: rawReadback.semanticReadGuard || null,
+        semanticReadGuard: readback.semanticReadGuard || null,
+        sourceUnchanged,
+        sourcePvfSha256: sourceSha256Before,
+        temporaryOutputPvfSha256: fs.existsSync(outputPvf) ? sha256File(outputPvf) : null,
+        temporaryOutputRetained: false,
+        runtimeValidationRequired: true,
+        staticChecksProveRuntimeBehavior: false,
+      };
+      for (const item of plan.items) outcomes.set(item.change.id, shared);
+    }
+  } catch (error) {
+    for (const plan of filePlans) for (const item of plan.items) outcomes.set(item.change.id, {
+      ok: false,
+      code: error.code || "EXISTING_NUT_ROUNDTRIP_FAILED",
+      reason: error.message,
+      pvfPath: plan.pvfPath,
+      sourcePvfSha256: sourceSha256Before,
+      sourceUnchanged: fs.existsSync(sourcePvf) && sha256File(sourcePvf) === sourceSha256Before,
+      temporaryOutputRetained: false,
+      runtimeValidationRequired: true,
+      staticChecksProveRuntimeBehavior: false,
+    });
+  } finally {
+    if (outputSessionId) try { await callAndParse(client, "pvf_close", { sessionId: outputSessionId }); } catch { /* preserve result */ }
+    if (sourceSessionId) try { await callAndParse(client, "pvf_close", { sessionId: sourceSessionId }); } catch { /* preserve result */ }
+    client.stop();
+    if (!pathInside(probeBase, probeRoot)) throw new Error(`Unsafe existing-NUT probe path: ${probeRoot}`);
     fs.rmSync(probeRoot, { recursive: true, force: true });
   }
   return outcomes;
@@ -3220,6 +4432,8 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
   const pendingWrites = new Map();
   const pendingNewFiles = [];
   const plannedTexts = new Map();
+  const existingNutPlans = [];
+  const nutAuditTextCache = new Map();
   try {
     for (const group of groupChangesByPvfPath(changeSet.changes)) {
       const pvfPath = group.pvfPath;
@@ -3236,7 +4450,46 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
         }
       }
       const writeFileChanges = group.changes.filter((change) => change.type === "write-file");
+      const copyFileChanges = group.changes.filter((change) => change.type === COPY_FILE_CHANGE_TYPE);
       const replaceChanges = group.changes.filter((change) => change.type === "replace-text");
+      if (copyFileChanges.length && (writeFileChanges.length || replaceChanges.length)) {
+        throw new Error(`同一目标路径不能混用 copy-file、write-file 或 replace-text：${pvfPath}`);
+      }
+      if (copyFileChanges.length > 1) {
+        throw new Error(`同一目标路径只能有一条 copy-file：${pvfPath}`);
+      }
+      if (copyFileChanges.length === 1) {
+        const change = copyFileChanges[0];
+        const source = await readVerifiedPvfCopySource(client, sessionId, changeSet, change, adapterConfig);
+        const targetExists = await pvfPathExists(client, sessionId, pvfPath, directoryCache);
+        const writeSafety = semanticWriteSafety({
+          kind: COPY_FILE_CHANGE_TYPE,
+          pvfPath,
+          pvfEncoding: change.pvfEncoding || changeSet.target.pvfReadEncoding,
+          fallbackEncoding: adapterConfig.defaults.pvfReadEncoding,
+          textContent: source.textContent,
+          samePvfCopyProof: source.samePvfCopyProof,
+        });
+        const result = {
+          id: change.id,
+          type: change.type,
+          pvfPath,
+          sourcePvfPath: source.sourcePvfPath,
+          sourceTextSha256: source.sourceTextSha256,
+          sourceLength: source.raw.length,
+          sourceSemanticReadGuard: source.semanticReadGuard,
+          expectAbsent: true,
+          targetExists,
+          applicable: !targetExists && writeSafety.allowed,
+          changed: !targetExists && writeSafety.allowed,
+          semanticWriteSafety: writeSafety,
+          rationale: change.rationale || "",
+        };
+        results.push(result);
+        pendingWrites.set(pvfPath.toLowerCase(), { change, source, targetExists, result });
+        pendingNewFiles.push({ change, source, targetExists, result });
+        continue;
+      }
       if (writeFileChanges.length && replaceChanges.length) {
         throw new Error(`同一目标路径不能同时包含 write-file 和 replace-text：${pvfPath}`);
       }
@@ -3303,6 +4556,21 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
       });
       plan.pvfPath = pvfPath;
       plannedTexts.set(pvfPath.toLowerCase(), plan.expectedText);
+      if (replaceChanges.some((change) => change.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE)) {
+        plan.existingNutAudit = await auditExistingNutControlledEdit({
+          client,
+          sessionId,
+          pvfPath,
+          sourceText: read.textContent,
+          finalText: plan.expectedText,
+          changes: replaceChanges,
+          changeSet,
+          adapterConfig,
+          textCache: nutAuditTextCache,
+        });
+        existingNutPlans.push(plan);
+        if (!plan.existingNutAudit.ok) blockPlanFromExistingNutAudit(plan);
+      }
       if (plan.blocked) {
         await diagnoseZeroOccurrenceItems(client, sessionId, plan, changeSet, adapterConfig);
       }
@@ -3370,8 +4638,24 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
           blockDetails: item.blockDetails || null,
           rawAsciiTokenPlanProof: rawAsciiPlanProofs.get(change.id) || null,
           writeProof: change.writeProof || null,
+          existingNutAudit: plan.existingNutAudit || null,
           rationale: change.rationale || "",
         });
+      }
+    }
+    enforceAtomicNutApidUniqueness(existingNutPlans);
+    for (const plan of existingNutPlans) {
+      if (plan.existingNutAudit?.ok === true) continue;
+      blockPlanFromExistingNutAudit(plan);
+      for (const item of plan.items) {
+        const result = results.find((entry) => entry.id === item.change.id);
+        if (!result) continue;
+        result.applicable = false;
+        result.changed = false;
+        result.blockCode = item.blockCode;
+        result.blockReason = item.blockReason;
+        result.blockDetails = item.blockDetails;
+        result.existingNutAudit = plan.existingNutAudit;
       }
     }
     for (const change of changeSet.changes.filter((item) =>
@@ -3435,8 +4719,10 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
     if (!pending.result.applicable || !pending.result.changed) continue;
     const outcome = newFileProbeOutcomes.get(pending.change.id) || {
       ok: false,
-      code: "HIGH_RISK_NEW_FILE_ROUNDTRIP_REQUIRED",
-      reason: "新增高风险文件缺少临时写出/编码往返证明。",
+      code: pending.change.type === COPY_FILE_CHANGE_TYPE ? "COPY_FILE_ROUNDTRIP_REQUIRED" : "HIGH_RISK_NEW_FILE_ROUNDTRIP_REQUIRED",
+      reason: pending.change.type === COPY_FILE_CHANGE_TYPE
+        ? "同一 PVF 文件复制缺少临时写出和独立读回证明。"
+        : "新增高风险文件缺少临时写出/编码往返证明。",
       temporaryOutputRetained: false,
     };
     pending.result.roundTripProbe = outcome;
@@ -3445,6 +4731,34 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
       pending.result.changed = false;
       pending.result.blockCode = outcome.code;
       pending.result.blockReason = outcome.reason;
+    }
+  }
+
+  const existingNutProbeOutcomes = await runExistingNutRoundTripProbe({
+    sourcePvf,
+    changeSet,
+    adapterConfig,
+    writePolicy,
+    filePlans: existingNutPlans.filter((plan) => !plan.blocked && plan.existingNutAudit?.ok === true),
+  });
+  for (const plan of existingNutPlans) {
+    for (const item of plan.items) {
+      const result = results.find((entry) => entry.id === item.change.id);
+      if (!result || !result.applicable || !result.changed) continue;
+      const outcome = existingNutProbeOutcomes.get(item.change.id) || {
+        ok: false,
+        code: "EXISTING_NUT_ROUNDTRIP_REQUIRED",
+        reason: "既有 NUT 缺少临时独立 PVF 写出和独立读回证明。",
+        temporaryOutputRetained: false,
+        runtimeValidationRequired: true,
+      };
+      result.existingNutRoundTripProbe = outcome;
+      if (!outcome.ok) {
+        result.applicable = false;
+        result.changed = false;
+        result.blockCode = outcome.code;
+        result.blockReason = outcome.reason;
+      }
     }
   }
 
@@ -3499,7 +4813,8 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
     persistentWriteOperationsExecuted: false,
     temporaryVerificationWriteOperationsExecuted: replacementPlans.some((plan) =>
       !plan.blocked && plan.items.some((item) => item.changed && isVerifiedInlineTextMode(item.change.textWriteMode))) ||
-      pendingNewFiles.some((item) => item.result.roundTripProbe?.ok === true),
+      pendingNewFiles.some((item) => item.result.roundTripProbe?.ok === true) ||
+      results.some((item) => item.existingNutRoundTripProbe?.ok === true),
     sourcePvf,
     protectedSourcePvf: input.protectedSourcePvf,
     protectedSourcePvfSha256: input.cumulative?.protectedSourcePvfSha256 || sourcePvfSha256AtEnd,
@@ -3529,7 +4844,29 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
       highRiskNewFileRoundTripProbeRequired: true,
       highRiskFinalIndependentReadbackRequired: true,
       highRiskSameExtensionReferenceRequired: true,
+      samePvfOrdinaryTextCopyAllowed: true,
+      samePvfCopyRequiresSameExtension: true,
+      samePvfCopyRequiresAbsentTarget: true,
+      samePvfCopyHighRiskExtensionsAllowed: false,
+      samePvfCopyRoundTripProbeRequired: true,
+      samePvfCopyModificationRequiresCumulativeNextRound: true,
+      samePvfCopyRoundTripExecuted: pendingNewFiles.some((item) => item.change.type === COPY_FILE_CHANGE_TYPE && item.result.roundTripProbe?.ok === true),
       existingHighRiskFileProtectionRemains: true,
+      existingNutControlledEditRequiresDedicatedProof: true,
+      existingNutAsciiOnly: true,
+      existingNutSourceTextSha256Required: true,
+      existingNutRawBytePreservingPatchRequired: true,
+      existingNutWholeFileReencodingAllowed: false,
+      existingNutNonTargetRawBytesMustRemainIdentical: true,
+      existingNutLoadChainRequired: true,
+      existingNutFunctionApiAndApidAuditRequired: true,
+      existingNutEvidenceMustBeExecutableCode: true,
+      existingNutApidMustBeExactIntegerLiteral: true,
+      existingNutApidMustBeDeclaredApiCallArgument: true,
+      existingNutTemporaryRoundTripRequired: true,
+      existingNutFinalIndependentReadbackRequired: true,
+      existingNutRuntimeValidationRequired: true,
+      existingCoSqrStrProtectionRemains: true,
       registryLifecycleOnlyForExplicitRowAdd: true,
       registryLifecycleExistingTextPreserved: true,
       registryLifecycleTargetClosureRequired: true,
@@ -3538,8 +4875,10 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
       stringLinkTextWriteAllowed: false,
       temporaryIsolatedEncodingProbeExecuted: replacementPlans.some((plan) =>
         !plan.blocked && plan.items.some((item) => item.changed && isVerifiedInlineTextMode(item.change.textWriteMode))),
-      highRiskNewFileAuditExecuted: pendingNewFiles.length > 0,
-      highRiskNewFileRoundTripExecuted: pendingNewFiles.some((item) => item.result.roundTripProbe?.ok === true),
+      highRiskNewFileAuditExecuted: pendingNewFiles.some((item) => item.change.type === "write-file" && Boolean(HIGH_RISK_NEW_FILE_MODES[extensionOf(item.change.pvfPath)])),
+      highRiskNewFileRoundTripExecuted: pendingNewFiles.some((item) => item.change.type === "write-file" && Boolean(HIGH_RISK_NEW_FILE_MODES[extensionOf(item.change.pvfPath)]) && item.result.roundTripProbe?.ok === true),
+      existingNutAuditExecuted: existingNutPlans.length > 0,
+      existingNutRoundTripExecuted: results.some((item) => item.existingNutRoundTripProbe?.ok === true),
       registryLifecycleChecksExecuted: results.some((item) => item.writeProof?.mode === "registry-lifecycle"),
       sameFileVerifiedInlineTextAppliedAsOneBatch: true,
       stringTableAppendedOncePerVerifiedFileBatch: true,
@@ -3553,6 +4892,11 @@ async function runDryRun(changeSet, changeSetFile, outDirOverride, loadedChangeS
       clientTextSmokeCheckRequiredCount: results.filter((item) => item.semanticWriteSafety?.clientTextSmokeCheckRequired).length,
       highRiskNewFileCount: results.filter((item) => item.type === "write-file" && HIGH_RISK_NEW_FILE_MODES[extensionOf(item.pvfPath)]).length,
       highRiskNewFilePassedCount: results.filter((item) => item.type === "write-file" && HIGH_RISK_NEW_FILE_MODES[extensionOf(item.pvfPath)] && item.highRiskAudit?.ok === true && item.roundTripProbe?.ok === true).length,
+      samePvfCopyCount: results.filter((item) => item.type === COPY_FILE_CHANGE_TYPE).length,
+      samePvfCopyPassedCount: results.filter((item) => item.type === COPY_FILE_CHANGE_TYPE && item.roundTripProbe?.ok === true && item.applicable).length,
+      existingNutControlledCount: results.filter((item) => item.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE).length,
+      existingNutControlledPassedCount: results.filter((item) => item.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE && item.existingNutAudit?.ok === true && item.existingNutRoundTripProbe?.ok === true && item.applicable).length,
+      inGameRuntimeValidationRequiredCount: results.filter((item) => item.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE && item.changed).length,
     },
     binding: dryRunManifestBinding(
       results,
@@ -3693,6 +5037,8 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
   const preflightPendingWrites = new Map();
   const preflightPlannedTexts = new Map();
   const preflightNewFiles = [];
+  const preflightExistingNutPlans = [];
+  const preflightNutAuditTextCache = new Map();
 
   try {
   // Build a read-only view of every final text before any in-memory write.
@@ -3700,9 +5046,24 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
   // even when the change-set contains both new files and existing-file edits.
   for (const group of groupChangesByPvfPath(changeSet.changes)) {
     const writeFileChanges = group.changes.filter((change) => change.type === "write-file");
+    const copyFileChanges = group.changes.filter((change) => change.type === COPY_FILE_CHANGE_TYPE);
     const replaceChanges = group.changes.filter((change) => change.type === "replace-text");
-    if (writeFileChanges.length > 1 || (writeFileChanges.length && replaceChanges.length)) {
-      throw new Error(`同一目标路径不能混用或重复 write-file：${group.pvfPath}`);
+    if (
+      writeFileChanges.length > 1 ||
+      copyFileChanges.length > 1 ||
+      (writeFileChanges.length && (replaceChanges.length || copyFileChanges.length)) ||
+      (copyFileChanges.length && replaceChanges.length)
+    ) {
+      throw new Error(`同一目标路径不能混用或重复 copy-file、write-file、replace-text：${group.pvfPath}`);
+    }
+    if (copyFileChanges.length === 1) {
+      const change = copyFileChanges[0];
+      const source = await readVerifiedPvfCopySource(client, sessionId, changeSet, change, adapterConfig);
+      const targetExists = await pvfPathExists(client, sessionId, group.pvfPath, directoryCache);
+      const pending = { change, source, targetExists };
+      preflightPendingWrites.set(normalizePvfPath(group.pvfPath).toLowerCase(), pending);
+      preflightNewFiles.push(pending);
+      continue;
     }
     if (writeFileChanges.length === 1) {
       const change = writeFileChanges[0];
@@ -3731,7 +5092,43 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
       const blocked = plan.items.find((item) => !item.applicable);
       throw codedError(blocked.blockCode || "FILE_CHANGE_SEQUENCE_BLOCKED", blocked.blockReason || "apply preflight blocked");
     }
+    plan.pvfPath = group.pvfPath;
+    if (replaceChanges.some((change) => change.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE)) {
+      plan.existingNutAudit = await auditExistingNutControlledEdit({
+        client,
+        sessionId,
+        pvfPath: group.pvfPath,
+        sourceText: read.textContent,
+        finalText: plan.expectedText,
+        changes: replaceChanges,
+        changeSet,
+        adapterConfig,
+        textCache: preflightNutAuditTextCache,
+      });
+      preflightExistingNutPlans.push(plan);
+    }
     preflightPlannedTexts.set(normalizePvfPath(group.pvfPath).toLowerCase(), plan.expectedText);
+  }
+  enforceAtomicNutApidUniqueness(preflightExistingNutPlans);
+  for (const plan of preflightExistingNutPlans) {
+    if (plan.existingNutAudit?.ok !== true) {
+      const error = new Error(`既有 NUT ${plan.pvfPath} 的正式生成前复核失败：${(plan.existingNutAudit?.errors || []).join("；")}`);
+      error.code = "EXISTING_NUT_AUDIT_FAILED";
+      error.details = plan.existingNutAudit;
+      throw error;
+    }
+    for (const item of plan.items) {
+      const authorized = authorizedResults.get(item.change.id);
+      if (
+        !authorized ||
+        authorized.writeProof?.mode !== EXISTING_NUT_CONTROLLED_MODE ||
+        authorized.existingNutAudit?.ok !== true ||
+        authorized.existingNutRoundTripProbe?.ok !== true ||
+        canonicalJsonSha256(authorized.existingNutAudit) !== canonicalJsonSha256(plan.existingNutAudit)
+      ) {
+        throw codedError("EXISTING_NUT_DRY_RUN_PROOF_MISMATCH", `既有 NUT ${item.change.id} 的预演审计或临时读回证据缺失/漂移；请重新预演。`);
+      }
+    }
   }
   for (const change of changeSet.changes.filter((item) =>
     item.type === "replace-text" && item.writeProof?.mode === "registry-lifecycle")) {
@@ -3781,7 +5178,70 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
         }
       }
       const writeFileChanges = group.changes.filter((change) => change.type === "write-file");
+      const copyFileChanges = group.changes.filter((change) => change.type === COPY_FILE_CHANGE_TYPE);
       const replaceChanges = group.changes.filter((change) => change.type === "replace-text");
+      if (copyFileChanges.length && (writeFileChanges.length || replaceChanges.length)) throw new Error(`同一目标路径不能混用 copy-file、write-file 或 replace-text：${pvfPath}`);
+      if (copyFileChanges.length > 1) throw new Error(`同一目标路径只能有一条 copy-file：${pvfPath}`);
+      if (copyFileChanges.length === 1) {
+        const change = copyFileChanges[0];
+        const source = await readVerifiedPvfCopySource(client, sessionId, changeSet, change, adapterConfig);
+        const targetExists = await pvfPathExists(client, sessionId, pvfPath, directoryCache);
+        if (targetExists) throw codedError("COPY_FILE_TARGET_EXISTS", `同一 PVF 文件复制目标已存在：${pvfPath}`);
+        const writeSafety = semanticWriteSafety({
+          kind: COPY_FILE_CHANGE_TYPE,
+          pvfPath,
+          pvfEncoding: change.pvfEncoding || changeSet.target.pvfReadEncoding,
+          fallbackEncoding: adapterConfig.defaults.pvfReadEncoding,
+          textContent: source.textContent,
+          samePvfCopyProof: source.samePvfCopyProof,
+        });
+        if (!writeSafety.allowed) throw codedError(writeSafety.code, `Change ${change.id} is blocked: ${writeSafety.reason}`);
+        const authorizedCopy = authorizedResults.get(change.id);
+        if (
+          authorizedCopy?.type !== COPY_FILE_CHANGE_TYPE ||
+          authorizedCopy?.sourcePvfPath !== source.sourcePvfPath ||
+          authorizedCopy?.sourceTextSha256 !== source.sourceTextSha256 ||
+          authorizedCopy?.roundTripProbe?.ok !== true ||
+          authorizedCopy?.roundTripProbe?.sourceUnchanged !== true ||
+          authorizedCopy?.roundTripProbe?.independentSemanticRead !== true ||
+          authorizedCopy?.roundTripProbe?.comparison?.ok !== true
+        ) {
+          throw codedError("COPY_FILE_DRY_RUN_PROOF_MISMATCH", `同一 PVF 文件复制 ${change.id} 的源文本或临时读回证据与预演不一致；请重新预演。`);
+        }
+        const applyResult = await callAndParse(client, "pvf_write_file", {
+          sessionId,
+          pvfPath,
+          textContent: source.textContent,
+          pvfEncoding: change.pvfEncoding || changeSet.target.pvfReadEncoding || adapterConfig.defaults.pvfReadEncoding,
+          compileScript: shouldCompileNewFile(pvfPath, change),
+          compileBinaryAni: false,
+          convertToTraditionalChinese: false,
+          samePvfCopyProof: source.samePvfCopyProof,
+        });
+        expectedAfterByPath.set(pvfPath, {
+          kind: COPY_FILE_CHANGE_TYPE,
+          sourceText: source.textContent,
+          sourceTextSha256: source.sourceTextSha256,
+          sourcePvfPath: source.sourcePvfPath,
+          pvfEncoding: change.pvfEncoding || changeSet.target.pvfReadEncoding || adapterConfig.defaults.pvfReadEncoding,
+          highRiskNewFile: false,
+        });
+        results.push({
+          id: change.id,
+          type: change.type,
+          pvfPath,
+          sourcePvfPath: source.sourcePvfPath,
+          sourceTextSha256: source.sourceTextSha256,
+          sourceLength: source.raw.length,
+          targetExistedBeforeApply: false,
+          changed: true,
+          semanticWriteSafety: writeSafety,
+          roundTripProbe: authorizedCopy.roundTripProbe,
+          applyResult,
+          rationale: change.rationale || "",
+        });
+        continue;
+      }
       if (writeFileChanges.length && replaceChanges.length) throw new Error(`同一目标路径不能混用 write-file 和 replace-text：${pvfPath}`);
       if (writeFileChanges.length > 1) throw new Error(`同一目标路径只能有一条 write-file：${pvfPath}`);
       if (writeFileChanges.length === 1) {
@@ -3876,6 +5336,12 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
         throw error;
       }
       buildSameFileApplicationPlan(plan);
+      const preflightNutPlan = preflightExistingNutPlans.find((candidate) =>
+        normalizePvfPath(candidate.pvfPath).toLowerCase() === normalizePvfPath(pvfPath).toLowerCase()) || null;
+      const highRiskExistingNut = replaceChanges.some((change) => change.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE);
+      if (highRiskExistingNut && preflightNutPlan?.existingNutAudit?.ok !== true) {
+        throw codedError("EXISTING_NUT_AUDIT_FAILED", `既有 NUT ${pvfPath} 缺少正式生成前专用审计。`);
+      }
       for (const item of plan.items) {
         const authorized = authorizedResults.get(item.change.id);
         const currentAnchor = item.contextAnchor;
@@ -3907,6 +5373,7 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
         expectedText: plan.expectedText,
         pvfEncoding,
         verifiedInlineText: verifiedItems.length > 0,
+        highRiskExistingNut,
         writerProofs: [],
         changeIds: plan.items.map((item) => item.change.id),
       });
@@ -3929,6 +5396,9 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
           semanticReadGuard: beforeRead.semanticReadGuard || null,
           semanticWriteSafety: item.semanticWriteSafety,
           encodingRoundTripProbe: authorizedResults.get(change.id)?.encodingRoundTripProbe || null,
+          writeProof: change.writeProof || null,
+          existingNutAudit: highRiskExistingNut ? preflightNutPlan.existingNutAudit : null,
+          existingNutRoundTripProbe: highRiskExistingNut ? authorizedResults.get(change.id)?.existingNutRoundTripProbe || null : null,
           applyResult: null,
           rationale: change.rationale || "",
         });
@@ -3972,7 +5442,20 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
           writerProofs.push(proof);
           result.applyResult = applied;
         } else {
-          result.applyResult = coordinatedApply.ordinaryResults.get(item.change.id) || null;
+          const applied = coordinatedApply.ordinaryResults.get(item.change.id) || null;
+          if (item.change.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE && applied?.existingNutTransition?.ok !== true) {
+            throw codedError("EXISTING_NUT_TRANSITION_AUDIT_FAILED", `既有 NUT ${item.change.id} 的最终文本写入审计未返回成功证明。`);
+          }
+          if (item.change.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE) {
+            const authorized = authorizedResults.get(item.change.id);
+            const expectedRawSha256 = String(authorized?.rawAsciiTokenPlanProof?.outputRawSha256 || "").toLowerCase();
+            const appliedRawSha256 = String(applied?.writeResult?.outputRawSha256 || "").toLowerCase();
+            if (!/^[a-f0-9]{64}$/u.test(expectedRawSha256) || appliedRawSha256 !== expectedRawSha256) {
+              throw codedError("EXISTING_NUT_APPLY_RAW_PLAN_MISMATCH", `既有 NUT ${item.change.id} 的正式原始字节计划与预演不一致。`);
+            }
+            expected.existingNutOutputRawSha256 = expectedRawSha256;
+          }
+          result.applyResult = applied;
         }
       }
       if (expected) {
@@ -4021,12 +5504,34 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
         // back through the independent TypeScript parser even when the change
         // is ASCII-only (notably .lst, whose native session metadata can lose
         // the script flag after a raw upsert).
-        semanticVerificationRead: expected.kind === "replace-text" || expected.highRiskNewFile === true,
+        semanticVerificationRead: expected.kind === "replace-text" || expected.kind === COPY_FILE_CHANGE_TYPE || expected.highRiskNewFile === true,
         maxChars: 0,
       });
       if (expected.kind === "replace-text") {
         const comparison = pvfTextReadbackResult(expected.expectedText, rb.textContent);
-        const independentSemanticRead = expected.verifiedInlineText === true
+        const rawReadback = expected.highRiskExistingNut === true
+          ? await callAndParse(client, "pvf_read_file", {
+            sessionId: readbackSessionId,
+            pvfPath,
+            pvfEncoding: expected.pvfEncoding,
+            semanticVerificationRead: true,
+            rawSha256Only: true,
+          })
+          : null;
+        const actualOutputRawSha256 = rawReadback
+          ? String(rawReadback.rawContentSha256 || "").toLowerCase()
+          : null;
+        const rawByteReadbackOk = expected.highRiskExistingNut === true
+          ? /^[a-f0-9]{64}$/u.test(String(expected.existingNutOutputRawSha256 || "")) &&
+            actualOutputRawSha256 === expected.existingNutOutputRawSha256
+          : null;
+        const independentRawRead = expected.highRiskExistingNut === true
+          ? rawReadback?.semanticReadGuard?.applied === true &&
+            rawReadback.semanticReadGuard?.reason === "verified-text-readback" &&
+            rawReadback.semanticReadGuard?.backend === "typescript-readonly-fallback" &&
+            rawReadback.semanticReadGuard?.selectedEncoding === expected.pvfEncoding
+          : null;
+        const independentSemanticRead = expected.verifiedInlineText === true || expected.highRiskExistingNut === true
           ? rb.semanticReadGuard?.applied === true &&
             rb.semanticReadGuard?.reason === "verified-text-readback" &&
             rb.semanticReadGuard?.backend === "typescript-readonly-fallback" &&
@@ -4044,7 +5549,9 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
           : null;
         const verifiedOk = expected.verifiedInlineText === true
           ? comparison.exactTextOk === true && independentSemanticRead && writerProofsOk && writerBatchProofOk
-          : comparison.ok;
+          : (expected.highRiskExistingNut === true
+            ? comparison.ok === true && independentSemanticRead && independentRawRead && rawByteReadbackOk
+            : comparison.ok);
         readback.push({
           pvfPath,
           kind: expected.kind,
@@ -4052,7 +5559,15 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
           ok: verifiedOk,
           verifiedInlineText: expected.verifiedInlineText === true,
           verifiedInlineCn: expected.verifiedInlineText === true && expected.pvfEncoding === "Cn",
+          highRiskExistingNut: expected.highRiskExistingNut === true,
+          runtimeValidationRequired: expected.highRiskExistingNut === true,
           independentSemanticRead,
+          independentRawRead,
+          rawByteReadbackOk,
+          expectedOutputRawSha256: expected.existingNutOutputRawSha256 || null,
+          actualOutputRawSha256,
+          rawContentBytes: rawReadback?.rawContentBytes ?? null,
+          rawSemanticReadGuard: rawReadback?.semanticReadGuard || null,
           semanticReadGuard: rb.semanticReadGuard || null,
           writerProofs: expected.writerProofs || [],
           writerBatchProof: expected.writerBatchProof || null,
@@ -4063,7 +5578,7 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
         const hasText = typeof rb.textContent === "string";
         if (hasText) {
           const comparison = pvfTextReadbackResult(expected.sourceText, rb.textContent);
-          const independentSemanticRead = expected.highRiskNewFile === true
+          const independentSemanticRead = expected.highRiskNewFile === true || expected.kind === COPY_FILE_CHANGE_TYPE
             ? rb.semanticReadGuard?.applied === true &&
               rb.semanticReadGuard?.reason === "verified-text-readback" &&
               rb.semanticReadGuard?.backend === "typescript-readonly-fallback" &&
@@ -4073,8 +5588,9 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
             pvfPath,
             kind: expected.kind,
             ...comparison,
-            ok: comparison.ok === true && (expected.highRiskNewFile !== true || independentSemanticRead),
+            ok: comparison.ok === true && ((expected.highRiskNewFile !== true && expected.kind !== COPY_FILE_CHANGE_TYPE) || independentSemanticRead),
             highRiskNewFile: expected.highRiskNewFile === true,
+            samePvfCopy: expected.kind === COPY_FILE_CHANGE_TYPE,
             independentSemanticRead,
             semanticReadGuard: rb.semanticReadGuard || null,
             metadata: rb.metadata,
@@ -4114,10 +5630,13 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
 
   const sourcePvfSha256AfterApply = sha256File(sourcePvf);
   const sourceUnchanged = sourcePvfSha256AfterApply.toLowerCase() === authorization.sourcePvfSha256.toLowerCase();
-  const protectedSourcePvf = input.protectedSourcePvf;
+  const protectedSourceInputPvf = input.protectedSourcePvf;
+  const protectedSourceOriginPvf = input.protectedSourceOriginPvf || protectedSourceInputPvf;
   const protectedSourcePvfSha256 = input.cumulative?.protectedSourcePvfSha256 || authorization.sourcePvfSha256;
+  const protectedSourceInputPvfSha256AfterApply = sha256File(protectedSourceInputPvf);
+  const protectedSourceUnchanged = protectedSourceInputPvfSha256AfterApply.toLowerCase() === protectedSourcePvfSha256.toLowerCase();
+  const protectedSourcePvf = paths.backupPath;
   const protectedSourcePvfSha256AfterApply = sha256File(protectedSourcePvf);
-  const protectedSourceUnchanged = protectedSourcePvfSha256AfterApply.toLowerCase() === protectedSourcePvfSha256.toLowerCase();
   const readbackOk = readback.every((item) => item.ok) && sourceUnchanged && protectedSourceUnchanged;
   const readbackExactCount = readback.filter((item) => item.ok && item.exactTextOk === true).length;
   const readbackNormalizedEquivalentCount = readback.filter((item) => item.ok && item.layoutNormalizationAccepted === true).length;
@@ -4140,6 +5659,7 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
     writeOperationsExecuted: true,
     sourcePvf,
     protectedSourcePvf,
+    protectedSourceOriginPvf,
     protectedSourcePvfSha256,
     protectedSourcePvfSha256AfterApply,
     outputPvf: paths.outputPvf,
@@ -4158,6 +5678,8 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
       sourceOverwritten: !sourceUnchanged,
       sourceUnchanged,
       protectedSourceUnchanged,
+      protectedSourceAnchoredByContentAddressedBackup: true,
+      protectedSourceOriginPathMayBeAuthorizedClientTarget: true,
       backupCreated: Boolean(backupResult?.targetPath && fs.existsSync(backupResult.targetPath)),
       backupContentAddressed: true,
       backupCreatedThisRun: backupResult?.created === true,
@@ -4190,7 +5712,29 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
       highRiskNewFileRoundTripProbeRequired: true,
       highRiskFinalIndependentReadbackRequired: true,
       highRiskSameExtensionReferenceRequired: true,
+      samePvfOrdinaryTextCopyAllowed: true,
+      samePvfCopyRequiresSameExtension: true,
+      samePvfCopyRequiresAbsentTarget: true,
+      samePvfCopyHighRiskExtensionsAllowed: false,
+      samePvfCopyRoundTripProbeRequired: true,
+      samePvfCopyModificationRequiresCumulativeNextRound: true,
       existingHighRiskFileProtectionRemains: true,
+      existingNutControlledEditRequiresDedicatedProof: true,
+      existingNutAsciiOnly: true,
+      existingNutSourceTextSha256Required: true,
+      existingNutRawBytePreservingPatchRequired: true,
+      existingNutWholeFileReencodingAllowed: false,
+      existingNutNonTargetRawBytesMustRemainIdentical: true,
+      existingNutLoadChainRequired: true,
+      existingNutFunctionApiAndApidAuditRequired: true,
+      existingNutEvidenceMustBeExecutableCode: true,
+      existingNutApidMustBeExactIntegerLiteral: true,
+      existingNutApidMustBeDeclaredApiCallArgument: true,
+      existingNutTemporaryRoundTripRequired: true,
+      existingNutFinalIndependentReadbackRequired: true,
+      existingNutFinalRawByteSha256ReadbackRequired: true,
+      existingNutRuntimeValidationRequired: true,
+      existingCoSqrStrProtectionRemains: true,
       registryLifecycleOnlyForExplicitRowAdd: true,
       registryLifecycleExistingTextPreserved: true,
       registryLifecycleTargetClosureRequired: true,
@@ -4218,6 +5762,11 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
         Tw: results.filter((item) => isVerifiedInlineTextMode(item.textWriteMode) && item.pvfEncoding === "Tw" && item.changed).length,
       },
       clientTextSmokeCheckRequiredCount: results.filter((item) => item.semanticWriteSafety?.clientTextSmokeCheckRequired).length,
+      samePvfCopyCount: results.filter((item) => item.type === COPY_FILE_CHANGE_TYPE && item.changed).length,
+      samePvfCopyReadbackPassedCount: readback.filter((item) => item.samePvfCopy === true && item.ok).length,
+      existingNutControlledCount: results.filter((item) => item.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE).length,
+      existingNutControlledReadbackPassedCount: readback.filter((item) => item.highRiskExistingNut === true && item.ok).length,
+      inGameRuntimeValidationRequiredCount: results.filter((item) => item.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE && item.changed).length,
     },
     cumulative: {
       enabled: Boolean(input.cumulative),
@@ -4226,6 +5775,7 @@ async function runApply(changeSet, changeSetFile, loadedChangeSetSha256) {
       inputPvf: sourcePvf,
       inputPvfSha256: authorization.sourcePvfSha256,
       protectedSourcePvf,
+      protectedSourceOriginPvf,
       protectedSourcePvfSha256,
       chainDepth: input.cumulative?.chainDepth || 0,
       previousChangeCount: input.cumulative?.previousChangeCount || 0,
@@ -4254,7 +5804,7 @@ async function main() {
     return;
   }
   if (command === "self-test") {
-    const report = changeSetAuthorizationSelfTest();
+    const report = await changeSetAuthorizationSelfTest();
     printJson(report);
     if (!report.summary.ok) process.exitCode = 1;
     return;
@@ -4320,6 +5870,7 @@ async function main() {
       outputPvf: manifest.outputPvf,
       backupPath: manifest.backupPath,
       summary: manifest.summary,
+      agentHandoff: applyAgentHandoff(manifestPath, manifest),
     });
     return;
   }

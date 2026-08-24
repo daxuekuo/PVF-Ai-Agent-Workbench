@@ -234,6 +234,30 @@ function createFixturePvf(targetPath, options = {}) {
       fileName: "skill/Swordman/MomentarySlashEx.skl",
       data: createScript([[5, 2], [7, 12], [5, 13], [7, 14], [5, 15], [7, 16]]),
     },
+    {
+      fileName: "sqr/character/fixture_load_state.nut",
+      data: Buffer.from('pushScriptFiles("character/fixture/passive_skill_fixture.nut");\r\n', "utf8"),
+    },
+    {
+      fileName: "sqr/character/fixture/passive_skill_fixture.nut",
+      data: Buffer.from('CNSquirrelAppendage.sq_AppendAppendage(obj, obj, -1, false, "character/fixture/appendage/ap_fixture.nut", true);\r\n', "utf8"),
+    },
+    {
+      fileName: "sqr/character/fixture/appendage/ap_fixture.nut",
+      data: Buffer.concat([
+        Buffer.from('function onStart(appendage)\r\n{\r\n\t// legacy-cn-byte:', "ascii"),
+        Buffer.from([0x81, 0x20]),
+        Buffer.from('\r\n\tappendage.sq_AddFunctionName("proc", "fixture_proc");\r\n}\r\n', "ascii"),
+      ]),
+    },
+    {
+      fileName: "sqr/fixture/api.nut",
+      data: Buffer.from("function fixture_api(obj) { CNSquirrelAppendage.sq_AddChangeStatusAppendageID(obj, obj, 1, 1, false, 1, 1); }\r\n", "utf8"),
+    },
+    {
+      fileName: "sqr/fixture/status.nut",
+      data: Buffer.from("function fixture_status() { return CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL; }\r\n", "utf8"),
+    },
     { fileName: "script/fallback_fixture.nut", data: Buffer.from('function fallback_fixture() { return "needle"; }\r\n', "utf8") },
     { fileName: "sprite/fallback_fixture.ani", data: createBinaryAni() },
     { fileName: "raw/fixture.bin", data: Buffer.from([0, 1, 2, 3, 254, 255]) },
@@ -402,6 +426,20 @@ async function main() {
             textContent: "#PVF_File\r\n",
           }).code === "PROTECTED_FILE_TYPE_WRITE_BLOCKED",
         ),
+    );
+    add(
+      "existing-high-risk-types-stay-blocked-without-specialized-proof",
+      [".co", ".lst", ".nut", ".sqr", ".str"].every((extension) => {
+        const result = semanticWriteSafety({
+          kind: "replace-text",
+          pvfPath: `existing/protected${extension}`,
+          pvfEncoding: "Tw",
+          previousText: "1",
+          newText: "2",
+          sourceText: "1",
+        });
+        return result.allowed === false && result.code === "PROTECTED_FILE_TYPE_WRITE_BLOCKED";
+      }),
     );
     const encodingConflictChoice = chooseSemanticReadCandidate(
       { isScriptFile: true, textContent: "[name]\r\n`太陽`\r\n" },
@@ -596,6 +634,11 @@ async function main() {
     add("fallback-rejects-corrupt-file-data", corruptFileRejected);
     const nut = await fallback.readFile(fallbackSessionId, "script/fallback_fixture.nut", { pvfEncoding: "Utf8" });
     add("fallback-nut", (nut.textContent || "").includes("needle"));
+    const nutRaw = await fallback.readFile(fallbackSessionId, "script/fallback_fixture.nut", { rawContent: true });
+    add(
+      "fallback-raw-plain-text-bytes",
+      Buffer.from(nutRaw.base64Content || "", "base64").equals(expectedFiles.get("script/fallback_fixture.nut")),
+    );
     const ani = await fallback.readFile(fallbackSessionId, "sprite/fallback_fixture.ani", {});
     add("fallback-binary-ani", (ani.textContent || "").includes("[FRAME MAX]") && (ani.textContent || "").includes("[FRAME000]"));
 
@@ -1353,7 +1396,9 @@ async function main() {
         autoTwRawReadResult?.textUsage?.selectedEncodings?.[0] === "Tw" &&
         autoTwRawReadResult?.textUsage?.automaticEncodingSelection?.automatic === true &&
         autoTwRawReadResult?.textUsage?.automaticEncodingSelection?.perFile?.[0]?.requestedEncoding === "Cn" &&
-        autoTwRawReadResult?.textUsage?.automaticEncodingSelection?.perFile?.[0]?.selectedEncoding === "Tw",
+        autoTwRawReadResult?.textUsage?.automaticEncodingSelection?.perFile?.[0]?.selectedEncoding === "Tw" &&
+        autoTwRawReadResult?.textUsage?.rawTextBindings?.[0]?.complete === true &&
+        /^[a-f0-9]{64}$/u.test(autoTwRawReadResult?.textUsage?.rawTextBindings?.[0]?.sourceTextSha256 || ""),
       autoTwRawReadResult,
     );
     const ordinaryReadCli = childProcess.spawnSync(
@@ -1799,6 +1844,113 @@ async function main() {
       );
       await controlledServerClient.callTool("pvf_close", { sessionId: controlledPlanSessionId });
 
+      const controlledNutOpened = parseBackendTextResult(await controlledServerClient.callTool("pvf_open", {
+        path: fixturePath,
+        encoding: "Cn",
+      }));
+      const controlledNutSessionId = controlledNutOpened?.session?.sessionId;
+      const controlledNutRead = parseBackendTextResult(await controlledServerClient.callTool("pvf_read_file", {
+        sessionId: controlledNutSessionId,
+        pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+        pvfEncoding: "Cn",
+        convertToSimplifiedChinese: false,
+        autoConvertStringLink: false,
+        semanticVerificationRead: true,
+      }));
+      const controlledNutSourceText = String(controlledNutRead?.textContent || "");
+      const controlledNutAddedFunction = 'function fixture_apply_status(obj)\r\n{\r\n\tCNSquirrelAppendage.sq_AddChangeStatusAppendageID(obj, obj, 120, CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL, false, 100, 9901);\r\n}\r\n';
+      const controlledNutProof = {
+        mode: "existing-nut-controlled-edit",
+        sourceTextSha256: crypto.createHash("sha256").update(controlledNutSourceText).digest("hex"),
+        structureCheckRequired: true,
+        temporaryRoundTripRequired: true,
+        runtimeValidationRequired: true,
+        loadChain: [
+          {
+            fromPvfPath: "sqr/character/fixture_load_state.nut",
+            toPvfPath: "sqr/character/fixture/passive_skill_fixture.nut",
+            requiredText: 'pushScriptFiles("character/fixture/passive_skill_fixture.nut");',
+          },
+          {
+            fromPvfPath: "sqr/character/fixture/passive_skill_fixture.nut",
+            toPvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+            requiredText: 'CNSquirrelAppendage.sq_AppendAppendage(obj, obj, -1, false, "character/fixture/appendage/ap_fixture.nut", true);',
+          },
+        ],
+        touchedFunctions: ["fixture_apply_status"],
+        apiSymbols: [
+          { name: "sq_AddChangeStatusAppendageID", kind: "function", targetEvidencePaths: ["sqr/fixture/api.nut"] },
+          { name: "CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL", kind: "constant", targetEvidencePaths: ["sqr/fixture/status.nut"] },
+        ],
+        apidPlan: { namespace: "fallback-fixture", ids: [9901], conflictSearchRequired: true },
+      };
+      const controlledNutPreviousText = "}\r\n";
+      const controlledNutNewText = `}\r\n\r\n${controlledNutAddedFunction}`;
+      const controlledNutSingleBypass = parseBackendTextResult(await controlledServerClient.callTool("pvf_replace_text", {
+        sessionId: controlledNutSessionId,
+        pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+        pvfEncoding: "Cn",
+        previousText: controlledNutPreviousText,
+        newText: controlledNutNewText,
+        writeProof: controlledNutProof,
+        dryRun: false,
+      }));
+      const controlledNutPlan = parseBackendTextResult(await controlledServerClient.callTool("pvf_apply_text_plan", {
+        sessionId: controlledNutSessionId,
+        pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+        pvfEncoding: "Cn",
+        dryRun: false,
+        changes: [{
+          id: "existing-nut-fixture",
+          previousText: controlledNutPreviousText,
+          newText: controlledNutNewText,
+          replaceAll: false,
+          expectedOccurrences: 1,
+          writeProof: controlledNutProof,
+        }],
+      }));
+      const controlledNutOutput = path.join(tempRoot, "controlled-existing-nut-output.pvf");
+      const controlledNutSave = parseBackendTextResult(await controlledServerClient.callTool("pvf_save", {
+        sessionId: controlledNutSessionId,
+        targetPath: controlledNutOutput,
+        allowOverwriteSource: false,
+      }));
+      await controlledServerClient.callTool("pvf_close", { sessionId: controlledNutSessionId });
+      const controlledNutReadbackOpened = parseBackendTextResult(await controlledServerClient.callTool("pvf_open", {
+        path: controlledNutOutput,
+        encoding: "Cn",
+      }));
+      const controlledNutReadbackSessionId = controlledNutReadbackOpened?.session?.sessionId;
+      const controlledNutReadback = parseBackendTextResult(await controlledServerClient.callTool("pvf_read_file", {
+        sessionId: controlledNutReadbackSessionId,
+        pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+        pvfEncoding: "Cn",
+        convertToSimplifiedChinese: false,
+        autoConvertStringLink: false,
+        semanticVerificationRead: true,
+      }));
+      await controlledServerClient.callTool("pvf_close", { sessionId: controlledNutReadbackSessionId });
+      const controlledNutExpectedText = controlledNutSourceText.replace(controlledNutPreviousText, controlledNutNewText);
+      add(
+        "controlled-existing-nut-batch-write-and-independent-readback",
+        controlledNutSingleBypass?.data?.code === "EXISTING_NUT_BATCH_PLAN_REQUIRED" &&
+          controlledNutPlan?.ok === true &&
+          controlledNutPlan?.existingNutTransition?.ok === true &&
+          controlledNutPlan?.results?.[0]?.mode === "existing-nut-controlled-edit" &&
+          controlledNutPlan?.results?.[0]?.originalRawBytesReencodedExactly === false &&
+          controlledNutPlan?.results?.[0]?.rawBytePreservingPatch === true &&
+          controlledNutPlan?.results?.[0]?.wholeFileReencodingUsed === false &&
+          controlledNutPlan?.results?.[0]?.nonTargetRawBytesPreserved === true &&
+          controlledNutPlan?.results?.[0]?.sourceReplacementCharacterCount > 0 &&
+          controlledNutPlan?.results?.[0]?.replacementCharactersPreserved === true &&
+          controlledNutSave?.ok === true &&
+          controlledNutReadback?.textContent === controlledNutExpectedText &&
+          controlledNutReadback?.semanticReadGuard?.reason === "verified-text-readback" &&
+          controlledNutReadback?.semanticReadGuard?.backend === "typescript-readonly-fallback" &&
+          sha256File(fixturePath) === sourceSha,
+        { singleBypass: controlledNutSingleBypass, plan: controlledNutPlan, save: controlledNutSave, readback: controlledNutReadback },
+      );
+
       const controlledCnOpened = parseBackendTextResult(await controlledServerClient.callTool("pvf_open", {
         path: cnFixturePath,
         encoding: "Tw",
@@ -1918,6 +2070,145 @@ async function main() {
       await controlledServerClient.callTool("pvf_close", { sessionId: controlledCnReadbackSessionId });
       controlledServerClient.stop();
       controlledServerClient = null;
+
+      const controlledNutCliChangeSetFile = path.join(tempRoot, "controlled-existing-nut-cli-change-set.json");
+      const controlledNutCliDryRunRoot = path.join(tempRoot, "controlled-existing-nut-cli-dry-run");
+      const controlledNutCliApplyRoot = path.join(tempRoot, "controlled-existing-nut-cli-apply");
+      fs.writeFileSync(controlledNutCliChangeSetFile, `${JSON.stringify({
+        schemaVersion: "1.0",
+        mode: "dry-run-only",
+        description: "Synthetic CLI round trip for a controlled existing NUT edit.",
+        target: {
+          sourcePvf: fixturePath,
+          pvfOpenEncoding: "Cn",
+          pvfReadEncoding: "Cn",
+        },
+        changes: [{
+          id: "existing-nut-cli-round-trip",
+          type: "replace-text",
+          pvfPath: "sqr/character/fixture/appendage/ap_fixture.nut",
+          previousText: controlledNutPreviousText,
+          newText: controlledNutNewText,
+          replaceAll: false,
+          expectedOccurrences: 1,
+          pvfEncoding: "Cn",
+          rationale: "Exercise validate, dry-run proof, apply, and independent readback.",
+          writeProof: controlledNutProof,
+        }],
+        safety: {
+          writeModeEnabled: false,
+          requiresBackupBeforeApply: true,
+          requiresExplicitOutputPath: true,
+          requiresReadback: true,
+        },
+      }, null, 2)}\n`, "utf8");
+      const controlledNutCli = path.join(workbenchRoot, "core", "pvf-agent-core", "cli", "pvf-change-set.js");
+      const controlledNutCliEnv = { ...process.env, PVF_WORKBENCH_BACKEND: "native" };
+      const controlledNutValidateProcess = childProcess.spawnSync(process.execPath, [
+        controlledNutCli,
+        "--root", workbenchRoot,
+        "validate",
+        "--file", controlledNutCliChangeSetFile,
+      ], { cwd: workbenchRoot, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: controlledNutCliEnv });
+      let controlledNutValidateResult = null;
+      try { controlledNutValidateResult = JSON.parse(controlledNutValidateProcess.stdout || "null"); } catch { /* recorded below */ }
+      const controlledNutDryRunProcess = controlledNutValidateProcess.status === 0
+        ? childProcess.spawnSync(process.execPath, [
+          controlledNutCli,
+          "--root", workbenchRoot,
+          "dry-run",
+          "--file", controlledNutCliChangeSetFile,
+          "--out", controlledNutCliDryRunRoot,
+        ], { cwd: workbenchRoot, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: controlledNutCliEnv })
+        : null;
+      let controlledNutDryRunResult = null;
+      try { controlledNutDryRunResult = JSON.parse(controlledNutDryRunProcess?.stdout || "null"); } catch { /* recorded below */ }
+      const controlledNutDryRunManifest = controlledNutDryRunResult?.manifestPath && fs.existsSync(controlledNutDryRunResult.manifestPath)
+        ? JSON.parse(fs.readFileSync(controlledNutDryRunResult.manifestPath, "utf8"))
+        : null;
+      const controlledNutApplyProcess = controlledNutDryRunProcess?.status === 0 && controlledNutDryRunResult?.approvalCode
+        ? childProcess.spawnSync(process.execPath, [
+          controlledNutCli,
+          "--root", workbenchRoot,
+          "apply",
+          "--file", controlledNutCliChangeSetFile,
+          "--dry-run-manifest", controlledNutDryRunResult.manifestPath,
+          "--authorize-apply", controlledNutDryRunResult.approvalCode,
+          "--out", controlledNutCliApplyRoot,
+        ], { cwd: workbenchRoot, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: controlledNutCliEnv })
+        : null;
+      let controlledNutApplyResult = null;
+      try { controlledNutApplyResult = JSON.parse(controlledNutApplyProcess?.stdout || "null"); } catch { /* recorded below */ }
+      const controlledNutApplyManifest = controlledNutApplyResult?.manifestPath && fs.existsSync(controlledNutApplyResult.manifestPath)
+        ? JSON.parse(fs.readFileSync(controlledNutApplyResult.manifestPath, "utf8"))
+        : null;
+      let controlledNutCliReadback = null;
+      if (controlledNutApplyManifest?.outputPvf && fs.existsSync(controlledNutApplyManifest.outputPvf)) {
+        const controlledNutCliOpened = await fallback.openSession(controlledNutApplyManifest.outputPvf, "Cn");
+        try {
+          controlledNutCliReadback = await fallback.readFile(
+            controlledNutCliOpened.sessionId,
+            "sqr/character/fixture/appendage/ap_fixture.nut",
+            { pvfEncoding: "Cn" },
+          );
+        } finally {
+          await fallback.closeSession(controlledNutCliOpened.sessionId);
+        }
+      }
+      const controlledNutCliExpectedText = controlledNutSourceText.replace(controlledNutPreviousText, controlledNutNewText);
+      const controlledNutCliOk =
+        controlledNutValidateProcess.status === 0 &&
+        controlledNutValidateResult?.ok === true &&
+        controlledNutValidateResult?.agentHandoff?.existingNutControlledEdit?.enabled === true &&
+        typeof controlledNutValidateResult?.agentHandoff?.nextCommandOnly === "string" &&
+        controlledNutDryRunProcess?.status === 0 &&
+        controlledNutDryRunResult?.summary?.blockedCount === 0 &&
+        typeof controlledNutDryRunResult?.approvalCode === "string" &&
+        controlledNutDryRunManifest?.safety?.existingNutAuditExecuted === true &&
+        controlledNutDryRunManifest?.safety?.existingNutRoundTripExecuted === true &&
+        controlledNutDryRunManifest?.summary?.existingNutControlledPassedCount === 1 &&
+        controlledNutDryRunManifest?.results?.[0]?.existingNutAudit?.ok === true &&
+        controlledNutDryRunManifest?.results?.[0]?.existingNutRoundTripProbe?.ok === true &&
+        controlledNutDryRunManifest?.results?.[0]?.existingNutRoundTripProbe?.independentRawRead === true &&
+        controlledNutDryRunManifest?.results?.[0]?.existingNutRoundTripProbe?.rawByteReadbackOk === true &&
+        controlledNutDryRunManifest?.results?.[0]?.existingNutRoundTripProbe?.expectedOutputRawSha256 ===
+          controlledNutDryRunManifest?.results?.[0]?.existingNutRoundTripProbe?.actualOutputRawSha256 &&
+        controlledNutDryRunManifest?.results?.[0]?.existingNutRoundTripProbe?.temporaryOutputRetained === false &&
+        controlledNutDryRunManifest?.results?.[0]?.rawAsciiTokenPlanProof?.rawBytePreservingPatch === true &&
+        controlledNutDryRunManifest?.results?.[0]?.rawAsciiTokenPlanProof?.wholeFileReencodingUsed === false &&
+        controlledNutDryRunManifest?.results?.[0]?.rawAsciiTokenPlanProof?.nonTargetRawBytesPreserved === true &&
+        controlledNutDryRunManifest?.results?.[0]?.rawAsciiTokenPlanProof?.sourceReplacementCharacterCount > 0 &&
+        controlledNutApplyProcess?.status === 0 &&
+        controlledNutApplyManifest?.safety?.sourceUnchanged === true &&
+        controlledNutApplyManifest?.safety?.backupSha256Verified === true &&
+        controlledNutApplyManifest?.safety?.readbackOk === true &&
+        controlledNutApplyManifest?.summary?.existingNutControlledReadbackPassedCount === 1 &&
+        controlledNutApplyManifest?.summary?.inGameRuntimeValidationRequiredCount === 1 &&
+        controlledNutApplyManifest?.readback?.[0]?.highRiskExistingNut === true &&
+        controlledNutApplyManifest?.readback?.[0]?.independentSemanticRead === true &&
+        controlledNutApplyManifest?.readback?.[0]?.independentRawRead === true &&
+        controlledNutApplyManifest?.readback?.[0]?.rawByteReadbackOk === true &&
+        controlledNutApplyManifest?.readback?.[0]?.expectedOutputRawSha256 ===
+          controlledNutApplyManifest?.readback?.[0]?.actualOutputRawSha256 &&
+        controlledNutCliReadback?.textContent === controlledNutCliExpectedText &&
+        sha256File(fixturePath) === sourceSha &&
+        sha256File(controlledNutApplyManifest.protectedSourcePvf) === sourceSha;
+      add(
+        "existing-nut-cli-validate-dry-run-apply-independent-readback",
+        controlledNutCliOk,
+        controlledNutCliOk ? undefined : {
+          validate: controlledNutValidateResult,
+          validateStderr: controlledNutValidateProcess.stderr,
+          dryRun: controlledNutDryRunResult,
+          dryRunStderr: controlledNutDryRunProcess?.stderr,
+          dryRunManifest: controlledNutDryRunManifest,
+          apply: controlledNutApplyResult,
+          applyStderr: controlledNutApplyProcess?.stderr,
+          applyManifest: controlledNutApplyManifest,
+          readback: controlledNutCliReadback,
+          sourceUnchanged: sha256File(fixturePath) === sourceSha,
+        },
+      );
 
       const changeSetFile = path.join(tempRoot, "verified-inline-cn-change-set.json");
       const dryRunRoot = path.join(tempRoot, "verified-inline-cn-dry-run");
@@ -2240,6 +2531,95 @@ async function main() {
         sourceUnchanged: sha256File(cnFixturePath) === cnSourceSha,
       });
 
+      const copyChangeSetFile = path.join(tempRoot, "same-pvf-copy-change-set.json");
+      const copyDryRunRoot = path.join(tempRoot, "same-pvf-copy-dry-run");
+      const copyApplyRoot = path.join(tempRoot, "same-pvf-copy-apply");
+      fs.writeFileSync(copyChangeSetFile, `${JSON.stringify({
+        schemaVersion: "1.0",
+        mode: "dry-run-only",
+        description: "Same-PVF ordinary text copy must bind source text, round-trip and independently read back.",
+        target: { sourcePvf: cnFixturePath, pvfOpenEncoding: "Tw", pvfReadEncoding: "Cn" },
+        changes: [{
+          id: "copy-existing-shop-template",
+          type: "copy-file",
+          sourcePvfPath: "etc/numeric.etc",
+          pvfPath: "etc/copied-numeric.etc",
+          expectAbsent: true,
+          pvfEncoding: "Cn",
+        }],
+        safety: {
+          writeModeEnabled: false,
+          requiresBackupBeforeApply: true,
+          requiresExplicitOutputPath: true,
+          requiresReadback: true,
+        },
+      }, null, 2)}\n`, "utf8");
+      const copyDryRunProcess = childProcess.spawnSync(process.execPath, [
+        pvfChangeCli, "--root", workbenchRoot, "dry-run", "--file", copyChangeSetFile, "--out", copyDryRunRoot,
+      ], { cwd: workbenchRoot, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: cliEnv });
+      let copyDryRunResult = null;
+      try { copyDryRunResult = JSON.parse(copyDryRunProcess.stdout || "null"); } catch { /* recorded below */ }
+      const copyApplyProcess = copyDryRunProcess.status === 0 && copyDryRunResult?.approvalCode
+        ? childProcess.spawnSync(process.execPath, [
+          pvfChangeCli, "--root", workbenchRoot, "apply", "--file", copyChangeSetFile,
+          "--dry-run-manifest", copyDryRunResult.manifestPath,
+          "--authorize-apply", copyDryRunResult.approvalCode,
+          "--out", copyApplyRoot,
+        ], { cwd: workbenchRoot, encoding: "utf8", maxBuffer: 16 * 1024 * 1024, env: cliEnv })
+        : null;
+      let copyApplyResult = null;
+      try { copyApplyResult = JSON.parse(copyApplyProcess?.stdout || "null"); } catch { /* recorded below */ }
+      const copyApplyManifest = copyApplyResult?.manifestPath && fs.existsSync(copyApplyResult.manifestPath)
+        ? JSON.parse(fs.readFileSync(copyApplyResult.manifestPath, "utf8"))
+        : null;
+      let copiedSourceText = null;
+      let copiedTargetText = null;
+      if (copyApplyManifest?.outputPvf && fs.existsSync(copyApplyManifest.outputPvf)) {
+        const copiedOpened = await fallback.openSession(copyApplyManifest.outputPvf, "Tw");
+        try {
+          copiedSourceText = (await fallback.readFile(copiedOpened.sessionId, "etc/numeric.etc", {
+            pvfEncoding: "Cn", autoConvertStringLink: false,
+          })).textContent;
+          copiedTargetText = (await fallback.readFile(copiedOpened.sessionId, "etc/copied-numeric.etc", {
+            pvfEncoding: "Cn", autoConvertStringLink: false,
+          })).textContent;
+        } finally {
+          await fallback.closeSession(copiedOpened.sessionId);
+        }
+      }
+      const samePvfCopyEndToEndOk =
+        copyDryRunProcess.status === 0 &&
+        copyDryRunResult?.summary?.samePvfCopyCount === 1 &&
+        copyDryRunResult?.summary?.samePvfCopyPassedCount === 1 &&
+        copyDryRunResult?.summary?.blockedCount === 0 &&
+        copyApplyProcess?.status === 0 &&
+        copyApplyManifest?.safety?.sourceUnchanged === true &&
+        copyApplyManifest?.safety?.samePvfOrdinaryTextCopyAllowed === true &&
+        copyApplyManifest?.safety?.samePvfCopyHighRiskExtensionsAllowed === false &&
+        copyApplyManifest?.summary?.samePvfCopyCount === 1 &&
+        copyApplyManifest?.summary?.samePvfCopyReadbackPassedCount === 1 &&
+        copyApplyManifest?.readback?.length === 1 &&
+        copyApplyManifest?.readback?.[0]?.samePvfCopy === true &&
+        copyApplyManifest?.readback?.[0]?.independentSemanticRead === true &&
+        copyApplyManifest?.readback?.[0]?.ok === true &&
+        copiedTargetText === copiedSourceText &&
+        typeof copiedTargetText === "string" &&
+        /\b10\b/.test(copiedTargetText) &&
+        sha256File(cnFixturePath) === cnSourceSha;
+      add("pvf-change-same-pvf-copy-end-to-end", samePvfCopyEndToEndOk, samePvfCopyEndToEndOk ? undefined : {
+        dryRunStatus: copyDryRunProcess.status,
+        dryRunStdout: copyDryRunProcess.stdout,
+        dryRunStderr: copyDryRunProcess.stderr,
+        dryRunResult: copyDryRunResult,
+        applyStatus: copyApplyProcess?.status,
+        applyStdout: copyApplyProcess?.stdout,
+        applyStderr: copyApplyProcess?.stderr,
+        applyManifest: copyApplyManifest,
+        copiedSourceText,
+        copiedTargetText,
+        sourceUnchanged: sha256File(cnFixturePath) === cnSourceSha,
+      });
+
       const scopeMismatchChangeSetFile = path.join(tempRoot, "exact-scope-count-mismatch-change-set.json");
       const scopeMismatchDryRunRoot = path.join(tempRoot, "exact-scope-count-mismatch-dry-run");
       fs.writeFileSync(scopeMismatchChangeSetFile, `${JSON.stringify({
@@ -2372,7 +2752,9 @@ async function main() {
               .update(JSON.stringify(manifest.cumulativeBaseline))
               .digest("hex");
         })() &&
-        cumulativeApplyManifest?.protectedSourcePvf === cnFixturePath &&
+        cumulativeApplyManifest?.protectedSourcePvf === applyManifest?.backupPath &&
+        cumulativeApplyManifest?.protectedSourceOriginPvf === cnFixturePath &&
+        sha256File(cumulativeApplyManifest.protectedSourcePvf) === cnSourceSha &&
         cumulativeApplyManifest?.sourcePvf === applyManifest?.outputPvf &&
         cumulativeApplyManifest?.safety?.sourceUnchanged === true &&
         cumulativeApplyManifest?.safety?.protectedSourceUnchanged === true &&
@@ -2629,6 +3011,32 @@ async function main() {
     },
     checks,
   };
+  const evidenceCheck = (id) => ({
+    id,
+    ok: checks.find((check) => check.id === id)?.ok === true,
+  });
+  const existingNutCliEvidence = evidenceCheck("existing-nut-cli-validate-dry-run-apply-independent-readback");
+  report.capabilityEvidence = {
+    existingNutControlledEdit: {
+      ok: existingNutCliEvidence.ok &&
+        checks.find((check) => check.id === "fallback-raw-plain-text-bytes")?.ok === true &&
+        checks.find((check) => check.id === "controlled-existing-nut-batch-write-and-independent-readback")?.ok === true &&
+        checks.find((check) => check.id === "fixture-unchanged")?.ok === true,
+      rawPlainTextBytes: evidenceCheck("fallback-raw-plain-text-bytes"),
+      controlledBatchWriteAndIndependentReadback: evidenceCheck("controlled-existing-nut-batch-write-and-independent-readback"),
+      cliLifecycle: {
+        ...existingNutCliEvidence,
+        stages: ["validate", "dry-run", "approval", "apply", "independent-readback"],
+        independentOutputRequired: true,
+        contentAddressedBackupVerified: true,
+        sourcePvfSha256UnchangedVerified: true,
+        temporaryAndFinalRawSha256ReadbackVerified: true,
+        temporaryProbeOutputRetained: false,
+      },
+      sourceFixtureUnchanged: evidenceCheck("fixture-unchanged"),
+      realPvfOrClientTouched: false,
+    },
+  };
   const reportDir = runtimePath(workbenchRoot, "self-tests", "fallback");
   fs.mkdirSync(reportDir, { recursive: true });
   const reportPath = path.join(reportDir, `FALLBACK-SELF-TEST-${new Date().toISOString().replace(/[:.]/g, "-")}.json`);
@@ -2641,6 +3049,7 @@ async function main() {
       phase: report.phase,
       reportPath,
       summary: report.summary,
+      capabilityEvidence: report.capabilityEvidence,
       failedChecks: checks.filter((check) => !check.ok),
     };
   process.stdout.write(`${JSON.stringify(visible, null, 2)}\n`);

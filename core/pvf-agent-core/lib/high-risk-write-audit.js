@@ -15,6 +15,8 @@ const HIGH_RISK_NEW_FILE_MODES = Object.freeze({
   ".str": "localization-new-file",
 });
 
+const EXISTING_NUT_CONTROLLED_MODE = "existing-nut-controlled-edit";
+
 const PROTECTED_EXISTING_FILE_EXTENSIONS = new Set([
   ".co", ".lst", ".nut", ".sqr", ".str",
 ]);
@@ -193,6 +195,471 @@ function scanBalancedScript(text, options = {}) {
   if (quote) errors.push("unclosed-backtick");
   if (stack.length) errors.push("unclosed-delimiter");
   return { ok: errors.length === 0, errors };
+}
+
+function safeAsciiScriptText(value) {
+  return typeof value === "string" && /^[\x09\x0a\x0d\x20-\x7e]*$/u.test(value);
+}
+
+function identifierPattern(value) {
+  return /^[A-Za-z_][A-Za-z0-9_.:]*$/u.test(String(value || ""));
+}
+
+function containsExactIdentifier(text, name) {
+  const escaped = String(name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const code = maskSquirrelNonCode(text).masked;
+  return escaped.length > 0 && new RegExp(`(^|[^A-Za-z0-9_])${escaped}(?=$|[^A-Za-z0-9_])`, "u").test(code);
+}
+
+function squirrelFunctionCallRanges(text, name) {
+  const source = String(text || "");
+  const escaped = String(name || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (!escaped.length) return [];
+  const code = maskSquirrelNonCode(source).masked;
+  const pattern = new RegExp(`(^|[^A-Za-z0-9_])(${escaped})\\s*\\(`, "gu");
+  const ranges = [];
+  let match;
+  while ((match = pattern.exec(code))) {
+    const nameStart = match.index + match[1].length;
+    const declarationPrefix = code.slice(Math.max(0, nameStart - 64), nameStart);
+    if (/\bfunction\s+[A-Za-z0-9_.:]*$/u.test(declarationPrefix)) continue;
+    const parenStart = code.indexOf("(", nameStart + match[2].length);
+    const parenEnd = matchingDelimiter(code, parenStart, "(", ")");
+    if (parenStart >= 0 && parenEnd >= 0) ranges.push({ nameStart, parenStart, parenEnd });
+  }
+  return ranges;
+}
+
+function containsExactFunctionCall(text, name) {
+  return squirrelFunctionCallRanges(text, name).length > 0;
+}
+
+function containsExactIntegerInFunctionCall(text, name, value) {
+  const source = String(text || "");
+  return squirrelFunctionCallRanges(source, name).some((range) =>
+    containsExactInteger(source.slice(range.parenStart + 1, range.parenEnd), value));
+}
+
+function containsExactInteger(text, value) {
+  const token = String(value);
+  const code = maskSquirrelNonCode(text).masked;
+  return new RegExp(`(^|[^A-Za-z0-9_.+\\-])${token}(?=$|[^A-Za-z0-9_.])`, "u").test(code);
+}
+
+function maskSquirrelComments(text) {
+  const source = String(text || "");
+  const chars = source.split("");
+  let state = "code";
+  let escaped = false;
+  for (let index = 0; index < chars.length; index += 1) {
+    const ch = source[index];
+    const next = source[index + 1];
+    if (state === "line-comment") {
+      if (ch === "\n" || ch === "\r") state = "code";
+      else chars[index] = " ";
+      continue;
+    }
+    if (state === "block-comment") {
+      if (ch === "*" && next === "/") {
+        chars[index] = " ";
+        chars[index + 1] = " ";
+        index += 1;
+        state = "code";
+      } else if (ch !== "\n" && ch !== "\r") chars[index] = " ";
+      continue;
+    }
+    if (["single-quote", "double-quote", "backtick"].includes(state)) {
+      const closing = state === "single-quote" ? "'" : state === "double-quote" ? '"' : "`";
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === closing) state = "code";
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      chars[index] = " ";
+      chars[index + 1] = " ";
+      index += 1;
+      state = "line-comment";
+    } else if (ch === "/" && next === "*") {
+      chars[index] = " ";
+      chars[index + 1] = " ";
+      index += 1;
+      state = "block-comment";
+    } else if (ch === "'") {
+      state = "single-quote";
+      escaped = false;
+    } else if (ch === '"') {
+      state = "double-quote";
+      escaped = false;
+    } else if (ch === "`") {
+      state = "backtick";
+      escaped = false;
+    }
+  }
+  return chars.join("");
+}
+
+function maskSquirrelNonCode(text) {
+  const source = String(text || "");
+  const chars = source.split("");
+  let state = "code";
+  let escaped = false;
+  for (let index = 0; index < chars.length; index += 1) {
+    const ch = source[index];
+    const next = source[index + 1];
+    if (state === "line-comment") {
+      if (ch === "\n" || ch === "\r") state = "code";
+      else chars[index] = " ";
+      continue;
+    }
+    if (state === "block-comment") {
+      if (ch === "*" && next === "/") {
+        chars[index] = " ";
+        chars[index + 1] = " ";
+        index += 1;
+        state = "code";
+      } else if (ch !== "\n" && ch !== "\r") chars[index] = " ";
+      continue;
+    }
+    if (["single-quote", "double-quote", "backtick"].includes(state)) {
+      const closing = state === "single-quote" ? "'" : state === "double-quote" ? '"' : "`";
+      if (ch !== "\n" && ch !== "\r") chars[index] = " ";
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === closing) state = "code";
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      chars[index] = " ";
+      chars[index + 1] = " ";
+      index += 1;
+      state = "line-comment";
+    } else if (ch === "/" && next === "*") {
+      chars[index] = " ";
+      chars[index + 1] = " ";
+      index += 1;
+      state = "block-comment";
+    } else if (ch === "'") {
+      chars[index] = " ";
+      state = "single-quote";
+      escaped = false;
+    } else if (ch === '"') {
+      chars[index] = " ";
+      state = "double-quote";
+      escaped = false;
+    } else if (ch === "`") {
+      chars[index] = " ";
+      state = "backtick";
+      escaped = false;
+    }
+  }
+  return {
+    masked: chars.join(""),
+    terminalState: state,
+    ok: state === "code" || state === "line-comment",
+  };
+}
+
+function containsExecutableFragment(text, fragment) {
+  const source = String(text || "");
+  const needle = String(fragment || "");
+  const anchorOffset = needle.search(/\S/u);
+  if (!needle.length || anchorOffset < 0) return false;
+  const code = maskSquirrelNonCode(source).masked;
+  const commentsRemoved = maskSquirrelComments(source);
+  let offset = source.indexOf(needle);
+  while (offset >= 0) {
+    const anchor = offset + anchorOffset;
+    const entirelyOutsideComments = [...needle].every((character, index) =>
+      /\s/u.test(character) || commentsRemoved[offset + index] === source[offset + index]);
+    if (entirelyOutsideComments && code[anchor] === source[anchor]) return true;
+    offset = source.indexOf(needle, offset + 1);
+  }
+  return false;
+}
+
+function matchingDelimiter(masked, start, opener, closer) {
+  if (masked[start] !== opener) return -1;
+  let depth = 0;
+  for (let index = start; index < masked.length; index += 1) {
+    if (masked[index] === opener) depth += 1;
+    else if (masked[index] === closer) {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function scanSquirrelStructure(text) {
+  const source = String(text || "");
+  const lexical = maskSquirrelNonCode(source);
+  const errors = [];
+  if (!source.trim()) errors.push("empty-source");
+  if (source.includes("\0")) errors.push("nul-byte");
+  if (!lexical.ok) errors.push(`unterminated-${lexical.terminalState}`);
+  const pairs = new Map([["}", "{"], ["]", "["], [")", "("]]);
+  const openers = new Set(["{", "[", "("]);
+  const stack = [];
+  for (let index = 0; index < lexical.masked.length; index += 1) {
+    const ch = lexical.masked[index];
+    if (openers.has(ch)) stack.push({ ch, index });
+    else if (pairs.has(ch)) {
+      const top = stack.pop();
+      if (!top || top.ch !== pairs.get(ch)) errors.push(`unbalanced-${ch}@${index}`);
+    }
+  }
+  if (stack.length) errors.push("unclosed-delimiter");
+
+  const candidates = [];
+  const patterns = [
+    /\bfunction\s+([A-Za-z_][A-Za-z0-9_.:]*)\s*\(/gu,
+    /\b([A-Za-z_][A-Za-z0-9_.:]*)\s*(?:<-|=)\s*function\s*\(/gu,
+  ];
+  for (const pattern of patterns) {
+    let match;
+    while ((match = pattern.exec(lexical.masked))) {
+      const parenStart = lexical.masked.indexOf("(", match.index);
+      const parenEnd = matchingDelimiter(lexical.masked, parenStart, "(", ")");
+      if (parenEnd < 0) {
+        errors.push(`function-parameters-unclosed:${match[1]}`);
+        continue;
+      }
+      let bodyStart = parenEnd + 1;
+      while (/\s/u.test(lexical.masked[bodyStart] || "")) bodyStart += 1;
+      if (lexical.masked[bodyStart] !== "{") {
+        errors.push(`function-body-missing:${match[1]}`);
+        continue;
+      }
+      const bodyEnd = matchingDelimiter(lexical.masked, bodyStart, "{", "}");
+      if (bodyEnd < 0) {
+        errors.push(`function-body-unclosed:${match[1]}`);
+        continue;
+      }
+      candidates.push({
+        name: match[1],
+        start: match.index,
+        bodyStart,
+        end: bodyEnd + 1,
+        text: source.slice(match.index, bodyEnd + 1),
+      });
+    }
+  }
+  candidates.sort((left, right) => left.start - right.start || right.end - left.end);
+  const functions = [];
+  for (const candidate of candidates) {
+    const overlapping = functions.find((item) => candidate.start < item.end && candidate.end > item.start);
+    if (overlapping) {
+      if (candidate.start !== overlapping.start || candidate.end !== overlapping.end) {
+        errors.push(`nested-or-overlapping-function:${candidate.name}`);
+      }
+      continue;
+    }
+    functions.push(candidate);
+  }
+  const counts = new Map();
+  for (const fn of functions) counts.set(fn.name, (counts.get(fn.name) || 0) + 1);
+  for (const [name, count] of counts) if (count !== 1) errors.push(`duplicate-function:${name}`);
+  return { ok: errors.length === 0, errors, functions, masked: lexical.masked };
+}
+
+function normalizedPathMention(text, pvfPath) {
+  const haystack = normalizePvfPath(text).toLowerCase();
+  const target = normalizePvfPath(pvfPath).toLowerCase();
+  const withoutSqr = target.startsWith("sqr/") ? target.slice(4) : target;
+  return Boolean(target) && (haystack.includes(target) || (withoutSqr && haystack.includes(withoutSqr)));
+}
+
+function pathMentionInsideFunctionCall(text, pvfPath) {
+  const source = String(text || "");
+  const target = normalizePvfPath(pvfPath).toLowerCase();
+  const variants = [target, target.startsWith("sqr/") ? target.slice(4) : target].filter(Boolean);
+  if (!variants.length) return false;
+  const code = maskSquirrelNonCode(source).masked;
+  const commentsRemoved = maskSquirrelComments(source).toLowerCase();
+  const pattern = /(^|[^A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_.:]*)\s*\(/gu;
+  let match;
+  while ((match = pattern.exec(code))) {
+    const nameStart = match.index + match[1].length;
+    const declarationPrefix = code.slice(Math.max(0, nameStart - 64), nameStart);
+    if (/\bfunction\s+[A-Za-z0-9_.:]*$/u.test(declarationPrefix)) continue;
+    const parenStart = code.indexOf("(", nameStart + match[2].length);
+    const parenEnd = matchingDelimiter(code, parenStart, "(", ")");
+    if (parenStart < 0 || parenEnd < 0) continue;
+    const argumentsWithoutComments = commentsRemoved.slice(parenStart + 1, parenEnd);
+    if (variants.some((candidate) => argumentsWithoutComments.includes(candidate))) return true;
+  }
+  return false;
+}
+
+function validateExistingNutWriteProofShape(pvfPath, proof) {
+  const errors = [];
+  const normalizedTarget = normalizePvfPath(pvfPath);
+  if (extensionOf(normalizedTarget) !== ".nut") errors.push(`${EXISTING_NUT_CONTROLLED_MODE} requires an existing .nut pvfPath`);
+  if (!normalizedTarget.toLowerCase().startsWith("sqr/")) errors.push(`${EXISTING_NUT_CONTROLLED_MODE} is limited to runtime scripts under sqr/`);
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) {
+    return { ok: false, expectedMode: EXISTING_NUT_CONTROLLED_MODE, errors: [`existing .nut requires writeProof.mode=${EXISTING_NUT_CONTROLLED_MODE}`] };
+  }
+  if (proof.mode !== EXISTING_NUT_CONTROLLED_MODE) errors.push(`writeProof.mode must be ${EXISTING_NUT_CONTROLLED_MODE}`);
+  if (!/^[a-f0-9]{64}$/iu.test(String(proof.sourceTextSha256 || ""))) errors.push("writeProof.sourceTextSha256 must be a SHA256 hex string");
+  for (const field of ["structureCheckRequired", "temporaryRoundTripRequired", "runtimeValidationRequired"]) {
+    if (proof[field] !== true) errors.push(`writeProof.${field} must be true`);
+  }
+  const loadChain = Array.isArray(proof.loadChain) ? proof.loadChain : [];
+  if (loadChain.length < 2) errors.push("writeProof.loadChain must contain load_state -> passive -> target links");
+  for (const [index, link] of loadChain.entries()) {
+    const fromPvfPath = normalizePvfPath(link?.fromPvfPath);
+    const toPvfPath = normalizePvfPath(link?.toPvfPath);
+    if (!fromPvfPath || extensionOf(fromPvfPath) !== ".nut") errors.push(`writeProof.loadChain[${index}].fromPvfPath must be a .nut path`);
+    if (!toPvfPath || extensionOf(toPvfPath) !== ".nut") errors.push(`writeProof.loadChain[${index}].toPvfPath must be a .nut path`);
+    if ((fromPvfPath && !fromPvfPath.toLowerCase().startsWith("sqr/")) || (toPvfPath && !toPvfPath.toLowerCase().startsWith("sqr/"))) {
+      errors.push(`writeProof.loadChain[${index}] paths must stay under sqr/`);
+    }
+    if (typeof link?.requiredText !== "string" || !link.requiredText.length || !safeAsciiScriptText(link.requiredText)) {
+      errors.push(`writeProof.loadChain[${index}].requiredText must be non-empty ASCII source text`);
+    } else if (!normalizedPathMention(link.requiredText, toPvfPath) || !pathMentionInsideFunctionCall(link.requiredText, toPvfPath)) {
+      errors.push(`writeProof.loadChain[${index}].requiredText must pass toPvfPath as an executable function-call argument`);
+    }
+    if (index > 0 && normalizePvfPath(loadChain[index - 1]?.toPvfPath).toLowerCase() !== fromPvfPath.toLowerCase()) {
+      errors.push(`writeProof.loadChain[${index}] is not continuous with the previous link`);
+    }
+  }
+  const firstFrom = normalizePvfPath(loadChain[0]?.fromPvfPath).toLowerCase();
+  if (loadChain.length && !/(?:^|\/)\w*_?load_state\.nut$/u.test(firstFrom)) errors.push("writeProof.loadChain must start from a load_state .nut");
+  if (loadChain.length && !loadChain.some((link) => /(?:^|\/)passive_skill_[^/]+\.nut$/u.test(normalizePvfPath(link?.fromPvfPath).toLowerCase()))) {
+    errors.push("writeProof.loadChain must include a passive_skill_*.nut source link");
+  }
+  const finalTo = normalizePvfPath(loadChain[loadChain.length - 1]?.toPvfPath).toLowerCase();
+  if (loadChain.length && finalTo !== normalizedTarget.toLowerCase()) errors.push("writeProof.loadChain must end at the edited .nut path");
+
+  const touchedFunctions = Array.isArray(proof.touchedFunctions) ? proof.touchedFunctions : [];
+  if (!touchedFunctions.length) errors.push("writeProof.touchedFunctions must name every added or modified function");
+  if (touchedFunctions.some((name) => !identifierPattern(name))) errors.push("writeProof.touchedFunctions contains an invalid function name");
+  if (new Set(touchedFunctions).size !== touchedFunctions.length) errors.push("writeProof.touchedFunctions contains duplicates");
+
+  const apiSymbols = Array.isArray(proof.apiSymbols) ? proof.apiSymbols : [];
+  if (!apiSymbols.length) errors.push("writeProof.apiSymbols must contain at least one DNF API or constant");
+  const apiSymbolKeys = apiSymbols.map((symbol) => `${String(symbol?.kind || "")}\0${String(symbol?.name || "")}`);
+  if (new Set(apiSymbolKeys).size !== apiSymbolKeys.length) errors.push("writeProof.apiSymbols contains duplicates");
+  for (const [index, symbol] of apiSymbols.entries()) {
+    if (!identifierPattern(symbol?.name)) errors.push(`writeProof.apiSymbols[${index}].name is invalid`);
+    if (!new Set(["function", "constant"]).has(symbol?.kind)) errors.push(`writeProof.apiSymbols[${index}].kind must be function or constant`);
+    if (!Array.isArray(symbol?.targetEvidencePaths) || symbol.targetEvidencePaths.length === 0) {
+      errors.push(`writeProof.apiSymbols[${index}].targetEvidencePaths must contain at least one target-PVF script`);
+    } else if (symbol.targetEvidencePaths.some((candidate) =>
+      !new Set([".nut", ".sqr"]).has(extensionOf(candidate)) || !normalizePvfPath(candidate).toLowerCase().startsWith("sqr/"))) {
+      errors.push(`writeProof.apiSymbols[${index}].targetEvidencePaths must contain only .nut/.sqr paths under sqr/`);
+    }
+  }
+
+  const apidPlan = proof.apidPlan;
+  if (!apidPlan || typeof apidPlan !== "object" || Array.isArray(apidPlan)) errors.push("writeProof.apidPlan is required");
+  else {
+    if (!/^[A-Za-z0-9._-]+$/u.test(String(apidPlan.namespace || ""))) errors.push("writeProof.apidPlan.namespace must be stable ASCII");
+    if (!Array.isArray(apidPlan.ids)) errors.push("writeProof.apidPlan.ids must be an array (use [] when no new APID is introduced)");
+    else {
+      if (apidPlan.ids.some((id) => !Number.isSafeInteger(id) || id <= 0 || id > 2147483647)) errors.push("writeProof.apidPlan.ids must contain positive 32-bit safe integers");
+      if (new Set(apidPlan.ids).size !== apidPlan.ids.length) errors.push("writeProof.apidPlan.ids contains duplicates");
+    }
+    if (apidPlan.conflictSearchRequired !== true) errors.push("writeProof.apidPlan.conflictSearchRequired must be true");
+  }
+  return { ok: errors.length === 0, expectedMode: EXISTING_NUT_CONTROLLED_MODE, errors };
+}
+
+function stripFunctionBodiesForTransition(text, functions) {
+  const source = String(text || "");
+  let cursor = 0;
+  const parts = [];
+  for (const fn of [...functions].sort((left, right) => left.start - right.start)) {
+    parts.push(source.slice(cursor, fn.start));
+    cursor = fn.end;
+  }
+  parts.push(source.slice(cursor));
+  return parts.join("").replace(/\s+/gu, "");
+}
+
+function validateExistingNutTextTransition(pvfPath, beforeText, afterText, proof, changes = []) {
+  const shape = validateExistingNutWriteProofShape(pvfPath, proof);
+  const errors = [...shape.errors];
+  const before = String(beforeText || "");
+  const after = String(afterText || "");
+  const beforeSha256 = sha256(Buffer.from(before, "utf8"));
+  const afterSha256 = sha256(Buffer.from(after, "utf8"));
+  if (shape.ok && String(proof.sourceTextSha256).toLowerCase() !== beforeSha256.toLowerCase()) {
+    errors.push("writeProof.sourceTextSha256 does not match the original raw .nut text");
+  }
+  for (const [index, change] of (Array.isArray(changes) ? changes : []).entries()) {
+    if (!safeAsciiScriptText(change?.previousText) || !safeAsciiScriptText(change?.newText)) {
+      errors.push(`change[${index}] must contain only ASCII text, Tab, CR and LF`);
+    }
+    if (/<\s*\d+\s*::[^>`]{1,512}`[^`]*`>/u.test(String(change?.previousText || "")) ||
+        /<\s*\d+\s*::[^>`]{1,512}`[^`]*`>/u.test(String(change?.newText || ""))) {
+      errors.push(`change[${index}] must not modify StringLink display text`);
+    }
+  }
+  const beforeStructure = scanSquirrelStructure(before);
+  const afterStructure = scanSquirrelStructure(after);
+  if (!beforeStructure.ok) errors.push(...beforeStructure.errors.map((item) => `source:${item}`));
+  if (!afterStructure.ok) errors.push(...afterStructure.errors.map((item) => `final:${item}`));
+  const beforeFunctions = new Map(beforeStructure.functions.map((fn) => [fn.name, fn]));
+  const afterFunctions = new Map(afterStructure.functions.map((fn) => [fn.name, fn]));
+  const touched = new Set(Array.isArray(proof?.touchedFunctions) ? proof.touchedFunctions : []);
+  const changedFunctions = [];
+  const addedFunctions = [];
+  for (const [name, sourceFn] of beforeFunctions) {
+    const finalFn = afterFunctions.get(name);
+    if (!finalFn) {
+      errors.push(`existing function was removed: ${name}`);
+      continue;
+    }
+    if (sourceFn.text !== finalFn.text) {
+      changedFunctions.push(name);
+      if (!touched.has(name)) errors.push(`modified function is missing from writeProof.touchedFunctions: ${name}`);
+    }
+  }
+  for (const [name] of afterFunctions) {
+    if (!beforeFunctions.has(name)) {
+      addedFunctions.push(name);
+      if (!touched.has(name)) errors.push(`added function is missing from writeProof.touchedFunctions: ${name}`);
+    }
+  }
+  for (const name of touched) {
+    if (!afterFunctions.has(name)) errors.push(`declared touched function is missing from final script: ${name}`);
+    else if (!changedFunctions.includes(name) && !addedFunctions.includes(name)) errors.push(`declared touched function did not change: ${name}`);
+  }
+  if (stripFunctionBodiesForTransition(before, beforeStructure.functions) !== stripFunctionBodiesForTransition(after, afterStructure.functions)) {
+    errors.push("existing NUT route cannot change non-function top-level code");
+  }
+  for (const symbol of Array.isArray(proof?.apiSymbols) ? proof.apiSymbols : []) {
+    const used = symbol?.kind === "function"
+      ? containsExactFunctionCall(after, symbol?.name)
+      : containsExactIdentifier(after, symbol?.name);
+    if (!used) errors.push(`declared API/constant is not used by final script: ${symbol?.name}`);
+  }
+  for (const id of Array.isArray(proof?.apidPlan?.ids) ? proof.apidPlan.ids : []) {
+    if (containsExactInteger(before, id)) errors.push(`new APID already occurs in the original target script: ${id}`);
+    const apiFunctions = (Array.isArray(proof?.apiSymbols) ? proof.apiSymbols : [])
+      .filter((symbol) => symbol?.kind === "function")
+      .map((symbol) => symbol.name);
+    if (!apiFunctions.some((name) => containsExactIntegerInFunctionCall(after, name, id))) {
+      errors.push(`declared APID is not used by a declared API call in the final target script: ${id}`);
+    }
+  }
+  return {
+    ok: errors.length === 0,
+    mode: EXISTING_NUT_CONTROLLED_MODE,
+    errors,
+    sourceTextSha256: beforeSha256,
+    finalTextSha256: afterSha256,
+    sourceStructureOk: beforeStructure.ok,
+    finalStructureOk: afterStructure.ok,
+    sourceFunctionCount: beforeStructure.functions.length,
+    finalFunctionCount: afterStructure.functions.length,
+    changedFunctions,
+    addedFunctions,
+    touchedFunctions: [...touched],
+    apids: Array.isArray(proof?.apidPlan?.ids) ? [...proof.apidPlan.ids] : [],
+  };
 }
 
 function validateNewFileText(pvfPath, text, proof = {}) {
@@ -400,6 +867,7 @@ function validateRegistryLifecycleTransition(beforeText, afterText, proofs, pvfP
 }
 
 module.exports = {
+  EXISTING_NUT_CONTROLLED_MODE,
   HIGH_RISK_NEW_FILE_MODES,
   PROTECTED_EXISTING_FILE_EXTENSIONS,
   extensionOf,
@@ -414,7 +882,16 @@ module.exports = {
   parseWorldmapUiButtons,
   parseWorldmapText,
   scanBalancedScript,
+  scanSquirrelStructure,
+  safeAsciiScriptText,
   sha256,
+  containsExactIdentifier,
+  containsExactFunctionCall,
+  containsExactInteger,
+  containsExactIntegerInFunctionCall,
+  containsExecutableFragment,
+  validateExistingNutTextTransition,
+  validateExistingNutWriteProofShape,
   validateNewFileText,
   validateRegistryLifecycleTransition,
   validateRegistryRowProof,

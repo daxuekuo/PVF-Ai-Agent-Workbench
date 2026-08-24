@@ -4,7 +4,7 @@
 
 ## 适用范围
 
-本卡只用于新增 `.co`、`.lst`、`.nut`、`.sqr`、`.str`、`.wdm`，以及给既有 `.lst` 增加明确的新登记行。它不授权普通修改既有 `.co/.nut/.sqr/.str`，也不授权客户端资源。
+本卡只用于新增 `.co`、`.lst`、`.nut`、`.sqr`、`.str`、`.wdm`，以及给既有 `.lst` 增加明确的新登记行。它不授权普通修改既有 `.co/.nut/.sqr/.str`，也不授权客户端资源。既有 `.nut` 的 ASCII 运行时修改另走 `pvf-existing-nut-controlled-change.zh-CN.md`，不能借用本卡的新文件证明。
 
 开始前仍须读取安全说明，并从目标 PVF 原始读回约 1–3 个同扩展名、同用途样本。`sourceFile` 放在工作台外的任务目录，`sourceSha256` 绑定该文件；`expectAbsent` 必须为 `true`。
 

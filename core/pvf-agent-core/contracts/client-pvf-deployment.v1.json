@@ -5,7 +5,8 @@
   "scope": {
     "allowedTarget": "The single Script.pvf at the root of a client directory recorded by an enabled local profile.",
     "forbiddenTargets": [
-      "source PVF",
+      "unanchored source PVF",
+      "verified protected-source anchor",
       "apply output PVF",
       "direct unprofiled path",
       "NPK",
@@ -15,7 +16,7 @@
     ]
   },
   "commands": {
-    "preview": "Verify a successful apply manifest, bind its output SHA256 and the current client Script.pvf SHA256, require the current client to match the apply input unless an explicit baseline switch is declared, then emit a deployment approval code without touching the client.",
+    "preview": "Verify a successful apply manifest, promote its SHA256-verified content-addressed source backup as the protected anchor when the original source is the live client Script.pvf, bind the output and current client SHA256 values, require baseline continuity unless an explicit switch is declared, then emit an approval code without touching the client.",
     "deploy": "Require the bound approval code and explicit client-closed confirmation, preserve a content-addressed backup, perform a same-directory staged replacement, and verify the deployed SHA256.",
     "rollback-preview": "Bind a completed deployment manifest, the current deployed SHA256, and the exact backup SHA256 without touching the client.",
     "rollback": "Require the bound rollback code and explicit client-closed confirmation, back up the current deployed version, restore through same-directory staging, and verify the restored SHA256.",
@@ -25,9 +26,9 @@
     "Default client writes remain disabled.",
     "Preview never writes the client.",
     "An apply output is deployable only when APPLY-MANIFEST.json binds its full SHA256 after successful readback.",
-    "The profile sourcePvf must match the apply manifest's original protected source and retain its bound SHA256.",
+    "The profile sourcePvf must match the apply manifest's protected anchor or recorded source-origin path.",
     "The current client must match the apply input (or already match the candidate output); a divergent baseline requires an explicitly bound branch-switch confirmation.",
-    "The original protected source, apply output PVF, and client target must be distinct; in a cumulative round the read-only apply input may be the client's already deployed prior version when their SHA256 values match.",
+    "The verified protected-source anchor, apply output PVF, and client target must be distinct. The recorded source-origin path may be the live client target only after its exact content-addressed backup is verified and promoted as that anchor; cumulative input may be the client's already deployed prior version when SHA256 matches.",
     "The current client SHA256 is rechecked immediately before replacement.",
     "A verified backup exists before the client target is replaced.",
     "Backups are content-addressed and never overwritten.",

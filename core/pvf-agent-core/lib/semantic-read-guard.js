@@ -1,5 +1,6 @@
 "use strict";
 
+const crypto = require("crypto");
 const path = require("path");
 const {
   VERIFIED_INLINE_TEXT_MODE,
@@ -11,10 +12,12 @@ const {
   compareChineseEncodingCandidates,
 } = require("../../../tools/pvf-bridge/fallback/codec.ts");
 const {
+  EXISTING_NUT_CONTROLLED_MODE,
   HIGH_RISK_NEW_FILE_MODES,
   PROTECTED_EXISTING_FILE_EXTENSIONS,
   extensionOf,
   validateNewFileText,
+  validateExistingNutWriteProofShape,
   validateWriteProofShape,
 } = require("./high-risk-write-audit");
 
@@ -179,7 +182,7 @@ function semanticWriteSafety(input = {}) {
   const extension = extensionOf(pvfPath) || path.posix.extname(pvfPath.toLowerCase());
   const encoding = normalizeEncoding(input.pvfEncoding, input.fallbackEncoding || "Tw");
   const sourceText = String(input.sourceText || "");
-  const payloads = input.kind === "write-file"
+  const payloads = new Set(["write-file", "copy-file"]).has(input.kind)
     ? [String(input.textContent || "")]
     : [String(input.previousText || ""), String(input.newText || "")];
   const clientTextSmokeCheckRequired =
@@ -187,6 +190,46 @@ function semanticWriteSafety(input = {}) {
     containsStringLinkToken(sourceText) ||
     containsNonAscii(sourceText) ||
     payloads.some(containsNonAscii);
+
+  if (input.kind === "copy-file") {
+    const proof = input.samePvfCopyProof;
+    const sourcePvfPath = String(proof?.sourcePvfPath || "").replace(/\\/g, "/").toLowerCase();
+    const targetPvfPath = pvfPath.toLowerCase();
+    const sourceExtension = path.posix.extname(sourcePvfPath);
+    const expectedTextSha256 = crypto.createHash("sha256").update(String(input.textContent || ""), "utf8").digest("hex");
+    const proofOk =
+      proof?.mode === "same-pvf-copy" &&
+      sourcePvfPath.length > 0 &&
+      sourcePvfPath !== targetPvfPath &&
+      sourceExtension === extension &&
+      /^[a-f0-9]{64}$/iu.test(String(proof?.sourceTextSha256 || "")) &&
+      String(proof.sourceTextSha256).toLowerCase() === expectedTextSha256;
+    if (!proofOk || PROTECTED_NEW_FILE_EXTENSIONS.has(extension)) {
+      return {
+        allowed: false,
+        code: PROTECTED_NEW_FILE_EXTENSIONS.has(extension)
+          ? "COPY_FILE_HIGH_RISK_TYPE_BLOCKED"
+          : "COPY_FILE_SOURCE_PROOF_REQUIRED",
+        reason: PROTECTED_NEW_FILE_EXTENSIONS.has(extension)
+          ? "同一 PVF 复制不能绕过高风险新增文件的专用证明流程。"
+          : "同一 PVF 复制缺少源路径、同扩展名和完整源文本哈希证明。",
+        clientTextSmokeCheckRequired,
+        noOp: false,
+      };
+    }
+    return {
+      allowed: true,
+      code: null,
+      reason: "同一 PVF 普通文本文件复制已绑定完整源文本；仍需临时输出和独立读回。",
+      details: {
+        mode: proof.mode,
+        sourcePvfPath: proof.sourcePvfPath,
+        sourceTextSha256: expectedTextSha256,
+      },
+      clientTextSmokeCheckRequired,
+      noOp: false,
+    };
+  }
 
   if (input.kind !== "write-file" && String(input.previousText || "") === String(input.newText || "")) {
     return {
@@ -268,12 +311,40 @@ function semanticWriteSafety(input = {}) {
       typeof input.writeProof?.registry?.expectedPvfPath === "string" &&
       input.writeProof.registry.expectedPvfPath.trim().length > 0 &&
       String(input.writeProof?.registry?.lstPath || "").replace(/\\/g, "/").toLowerCase() === pvfPath.toLowerCase();
-    if (!registryEdit) {
+    const existingNutEdit = extension === ".nut" &&
+      input.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE &&
+      validateExistingNutWriteProofShape(pvfPath, input.writeProof).ok === true;
+    if (!registryEdit && !existingNutEdit) {
       return {
         allowed: false,
         code: "PROTECTED_FILE_TYPE_WRITE_BLOCKED",
-        reason: `已保持既有高风险文件保护：${extension} 只能通过专用登记表生命周期或新增文件受控流程处理。`,
+        reason: `已保持既有高风险文件保护：${extension} 只能通过匹配的既有 NUT 专用流程、登记表生命周期或新增文件受控流程处理。`,
         clientTextSmokeCheckRequired: true,
+        noOp: false,
+      };
+    }
+    if (existingNutEdit) {
+      if (
+        containsNonAscii(newWritePayload) ||
+        containsNonAscii(String(input.previousText || "")) ||
+        containsStringLinkToken(newWritePayload) ||
+        containsStringLinkToken(String(input.previousText || ""))
+      ) {
+        return {
+          allowed: false,
+          code: "PROTECTED_FILE_TYPE_WRITE_BLOCKED",
+          reason: "既有 NUT 专用路线只允许数字、英文、Tab、换行和常见符号；中文等文字与 StringLink 显示文本仍被阻止。",
+          clientTextSmokeCheckRequired: true,
+          noOp: false,
+        };
+      }
+      return {
+        allowed: true,
+        code: null,
+        reason: "既有 NUT 已提交专用证明；仍需原文哈希、加载链、函数/API/APID、临时独立 PVF 往返及最终读回检查。",
+        details: { mode: EXISTING_NUT_CONTROLLED_MODE },
+        clientTextSmokeCheckRequired: false,
+        runtimeValidationRequired: true,
         noOp: false,
       };
     }

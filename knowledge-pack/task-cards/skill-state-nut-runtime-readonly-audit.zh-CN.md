@@ -46,6 +46,8 @@
 17. 遇到 skill-load 或再次施放逻辑，区分“首次进入角色 state”和“再次命令已有 PO/appendage”；闭合 `sq_AddSkillLoad`、`sq_GetSkillLoad`、`use/isCooling`、`sq_RemoveSkillLoad` 和冷却启动条件。
 18. 遇到一个明确 NUT API，先运行一次精确 `knowledge-query nut --group dnf --exact`，再运行一次目标 `pvf-read search-script --keyword <symbol>`；这两步已完成声明与目标调用观察，不探测 help 或目录。没有候选就写“未找到相关函数”，不要补函数名。
 
+只读闭合后如确需修改已经存在的 appendage NUT，只进入 `pvf-existing-nut-controlled-change.zh-CN.md` 的专用路线；静态预演不会把命中、状态抗性、持续时间、刷新/叠加或同步提升为已验证行为。
+
 ## 验收
 
 - 技能 ID 已按正确职业 skill registry 解析。

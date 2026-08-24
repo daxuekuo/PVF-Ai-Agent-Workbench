@@ -49,6 +49,7 @@
 ## 写入边界
 
 - 写 PVF 必须使用受控 change-set、显式输出、备份、manifest 和读回。
+- 修改既有 appendage `.nut` 时只使用 `pvf-existing-nut-controlled-change.zh-CN.md`；原文 SHA256、目标路径作为函数调用参数的 load_state/passive/appendage 加载链、目标 API、函数/APID、临时与最终独立文本/原始字节 SHA256 读回缺一项即停止。静态通过不证明状态抗性数值或时序正确。
 - 不覆盖源 PVF。
 - 不改客户端资源，除非用户单独授权。
 - 不把当前项目路径、历史报告、运行输出或证据链写进 clean knowledge。

@@ -220,6 +220,13 @@
         "safety/README.zh-CN.md"
       ]
     },
+    "same-pvf-file-copy": {
+      "status": "默认可用",
+      "entries": [
+        "task-cards/pvf-same-pvf-file-copy-controlled-change.zh-CN.md",
+        "safety/README.zh-CN.md"
+      ]
+    },
     "skill-learnability-cooldown": {
       "status": "默认可用",
       "entries": [
@@ -237,7 +244,17 @@
         "dictionaries/nut-runtime-api-boundary-quick.zh-CN.md",
         "indexes/skill-state-nut-runtime-api-group-boundary.zh-CN.md",
         "workflows/skill-runtime-parameter-edit.zh-CN.md",
-        "task-cards/skill-state-nut-runtime-readonly-audit.zh-CN.md"
+        "task-cards/skill-state-nut-runtime-readonly-audit.zh-CN.md",
+        "task-cards/pvf-existing-nut-controlled-change.zh-CN.md"
+      ]
+    },
+    "existing-nut-controlled-edit": {
+      "status": "默认可用",
+      "entries": [
+        "safety/README.zh-CN.md",
+        "task-cards/pvf-existing-nut-controlled-change.zh-CN.md",
+        "task-cards/skill-state-nut-runtime-readonly-audit.zh-CN.md",
+        "dictionaries/nut-runtime-api-boundary-quick.zh-CN.md"
       ]
     },
     "action-combat-cross-version-porting": {
@@ -248,6 +265,7 @@
         "workflows/action-combat-cross-version-porting.zh-CN.md",
         "task-cards/pvf-registry-lst-topology-readonly-audit.zh-CN.md",
         "task-cards/skill-state-nut-runtime-readonly-audit.zh-CN.md",
+        "task-cards/pvf-existing-nut-controlled-change.zh-CN.md",
         "dictionaries/skill-learnability-command-cooldown-fields.zh-CN.md",
         "dictionaries/nut-runtime-api-boundary-quick.zh-CN.md"
       ]
@@ -260,6 +278,7 @@
         "workflows/action-combat-cross-version-porting.zh-CN.md",
         "task-cards/pvf-registry-lst-topology-readonly-audit.zh-CN.md",
         "task-cards/skill-state-nut-runtime-readonly-audit.zh-CN.md",
+        "task-cards/pvf-existing-nut-controlled-change.zh-CN.md",
         "dictionaries/skill-learnability-command-cooldown-fields.zh-CN.md",
         "dictionaries/nut-runtime-api-boundary-quick.zh-CN.md"
       ]
@@ -380,6 +399,7 @@
       "status": "默认可用",
       "entries": [
         "task-cards/dungeon-difficulty-ultimate-list-readonly-audit.zh-CN.md",
+        "task-cards/pvf-same-pvf-file-copy-controlled-change.zh-CN.md",
         "dictionaries/dungeon-difficulty-ultimate-list-fields.zh-CN.md",
         "workflows/dungeon-difficulty-and-ultimate-list-audit.zh-CN.md",
         "safety/README.zh-CN.md"

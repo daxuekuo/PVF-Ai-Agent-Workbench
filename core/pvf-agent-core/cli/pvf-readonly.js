@@ -231,7 +231,9 @@ function rawReadAgentHandoff() {
       linkedVerifiedTextAndParameters: "workspaces/examples/change-set.verified-cn-text.example.json",
       exactHomomorphicBlockScope: "workspaces/examples/change-set.exact-scope.example.json",
       cumulativeSecondRound: "workspaces/examples/change-set.cumulative-second-round.example.json",
+      existingNutControlledEdit: "workspaces/examples/change-set.existing-nut-controlled.example.json",
     },
+    completeRawTextSha256AvailableIn: "textUsage.rawTextBindings",
     sourceIdentityWhenExplicitlyRequired: sourceIdentityAgentHandoff(),
     writeCapabilityPreflight: writeCapabilityAgentHandoff(),
     schemaLookupRequired: false,
@@ -257,6 +259,30 @@ function selectedReadEncodings(result, requestedEncoding) {
   return values;
 }
 
+function rawTextBindings(result) {
+  const hash = (value) => crypto.createHash("sha256").update(String(value), "utf8").digest("hex");
+  const lineSliceRequested = option("--start-line") !== undefined || option("--end-line") !== undefined;
+  if (command === "read") {
+    const complete = !lineSliceRequested && result?.truncated !== true && typeof result?.textContent === "string";
+    return [{
+      pvfPath: normalizePvfPath(result?.fileName || option("--path", "")),
+      complete,
+      sourceTextSha256: complete ? hash(result.textContent) : null,
+    }];
+  }
+  if (command === "read-batch") {
+    return (result?.items || []).map((item, index) => {
+      const complete = !lineSliceRequested && result?.truncatedByTotalLimit !== true && item?.truncated !== true && typeof item?.textContent === "string";
+      return {
+        pvfPath: normalizePvfPath(item?.fileName || options("--path")[index] || ""),
+        complete,
+        sourceTextSha256: complete ? hash(item.textContent) : null,
+      };
+    });
+  }
+  return [];
+}
+
 function readTextUsage(result, config, readPreparation = null) {
   if (command !== "read" && command !== "read-batch") return null;
   const raw = rawDisplayMode();
@@ -274,6 +300,7 @@ function readTextUsage(result, config, readPreparation = null) {
     requestedEncoding,
     selectedEncodings,
     responseTruncated: truncated,
+    ...(raw ? { rawTextBindings: rawTextBindings(result) } : {}),
     warning: raw
       ? (truncated
         ? "这是修改校验使用的原始 token 排列，但返回内容已截断；只能复制首尾都完整可见的 token。"

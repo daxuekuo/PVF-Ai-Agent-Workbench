@@ -1,64 +1,28 @@
-# GitHub 3.0.0 发布清单
+# GitHub 发布清单
 
-本清单用于把当前干净目录同步到 GitHub。Gate 报告、真实 PVF、客户端、
-本机 profile 和研究目录都不进入仓库。
+本清单只用于维护者发布。提交、推送、打 tag、创建 Release 和修改 `VERSION` 都需要单独明确授权。
 
-## 同步方式
+## 发布前
 
-1. 使用 Git 客户端克隆远端仓库；不要使用 GitHub 网页逐文件上传。
-2. 用本目录覆盖克隆目录中的工作台文件后执行 `git add -A`。必须使用
-   `-A`，因为只复制新文件不会删除远端旧文件。
-3. 确认以下 1.0/1.1 遗留文件显示为删除：
+1. 确认 `VERSION` 和更新日志符合本次发布计划，没有把未完成能力写成已发布。
+2. 运行 `workbench.bat release all`，只接受 Gate1、Gate2、Gate3 全部通过的源码树。
+3. 如果修改过 `AGENTS.md`、随包 Skill、安全路由或 Agent 行为，在全新发布 stage 中再完成一次真实外部 Agent 黑盒；内置 eval 不能代替。
+4. 检查 `git status --short`，确认没有真实 PVF、客户端、NPK/IMG、密钥、本机 profile、数据库、缓存、压缩包或运行报告。
+5. 确认 `runtime/node/node.exe` 是普通 Git blob，不是 Git LFS pointer。它会触发 GitHub 50 MiB 警告，但必须保留在 Source code zip 中才能开箱即用。
 
-   - `config/mcp-templates/host-agent-notes.zh-CN.md`
-   - `config/mcp-templates/pvf-agent-core.system-node.fragment.json`
-   - `config/mcp-templates/pvf-agent-core.windows-bundled-node.fragment.json`
-   - `config/mcp-templates/README.zh-CN.md`
-   - `config/mcp-templates/typesquirrel-optional.zh-CN.md`
-   - `config/mcp.json`
-   - `core/pvf-agent-core/lib/mcp-stdio-client.js`
-   - `core/pvf-agent-core/mcp/README.md`
-   - `core/pvf-agent-core/mcp/server.js`
+发布门禁报告、黑盒报告、真实 PVF、客户端和本机状态全部留在 Workbench 外。
 
-4. 运行 `workbench.bat release all`，只提交 Gate 全通过的源码树；外部
-   runtime state 中的报告不提交。
-5. 如果修改过 `AGENTS.md`、随包 Skill 或安全路由，必须再用全新会话完成
-   一次真实外部 Agent 黑盒；内置 `eval self-test` 不能代替。报告留在工作台
-   外，并确认第一工具、第一命令、源指纹时序、错误安全停止、连续修改、
-   最终读回及无帮助/目录/`check` 绕路。
-6. 确认 `runtime/node/node.exe` 是普通 Git blob，不是 Git LFS pointer。
-   它会触发 GitHub 的 50 MiB 警告，但低于 100 MiB 单文件硬限制。保留
-   普通 Git blob 才能让 GitHub 自动生成的 Source code zip 开箱即用。
-7. 检查 `git status --short`，确认没有真实 `.pvf/.npk/.img`、本机路径、
-   secret、数据库、压缩包、缓存目录或 Gate 输出。
-8. 提交并推送后，在远端 tag 对应的 Source code zip 中再次运行
-   `workbench.bat check`、`workbench.bat pvf-change self-test`、
-   `workbench.bat client-pvf self-test`、`workbench.bat fallback-self-test` 和
-   `workbench.bat release gate3`，再创建 `v3.0.0`
-   Release。
+## 远端复查
+
+1. 推送后从目标 tag 下载 GitHub 自动生成的 Source code zip。
+2. 在解压后的独立目录重新运行 `check`、受控写入自检、客户端部署自检、备用后端自检和 Gate3。
+3. 结果通过后，再按仓库 `VERSION` 创建对应的 `v<VERSION>` Release。
 
 ## 发布措辞边界
 
-- 可以声明普通 PVF 任务无需已下架 VSCode 插件、外部 `pvf_bridge` MCP、
-  TypeSquirrel、npm 或联网下载。
-- 可以声明发行包固定支持 64 位 Windows，并随包携带 Node.js。
-- 在找回 native Rust 源码与锁文件并重编译前，不要声明整个 native
-  后端可由本仓库源码复现。
-- 在全新 Windows 没有兼容 VC++ v14 runtime 时，可以声明只读查询仍由
-  随包 TypeScript 备用后端工作，但不能声明 PVF 写入可用。
-  `workbench.bat check` 会明确显示 degraded read-only 并给出微软官方 x64
-  运行库链接。人工交互终端会打开官方说明页；Agent/CI 不弹窗，也不会
-  自动下载或安装。
-- 可以声明 `Cn` 搜索、`.str`、StringLink 与中文脚本读取会自动进行语义
-  保护；也可以声明普通脚本中完整中文名称/描述支持单行、多行和精确计数
-  批量，参数与中文可在同文件联动验证。不能宣传成任意中文都可写；
-  `Cn .str`、StringLink 显示文本、部分中文 token、未计数批量和无法编码
-  字符仍必须失败关闭，最终仍需游戏内文字检查。
-- 可以声明新增 `.co`、`.lst`、`.nut`、`.sqr`、`.str`、`.wdm` 支持受控
-  `writeProof` 生命周期；它们必须通过目标格式、冲突/引用闭合、脚本结构、
-  临时写出或编码往返和独立读回。既有高风险文件的普通修改仍被阻止；新增 worldmap
-  还必须原子核对 registry、UI、dungeon、town/region，不能把静态核验宣传
-  成客户端或游戏内功能验证。
-- 可以声明已复查的独立输出 PVF 可在单独预览和确认后部署到 profile 指定
-  的测试客户端，并可恢复部署前版本；不能把这项权限扩大为 NPK、IMG、UI
-  或其他客户端资源写入，也不能把文件部署成功宣传为实机功能通过。
+- 可以声明支持 64 位 Windows，随包携带 Node.js，普通任务不依赖 npm、外部 MCP 或已下架插件。
+- native 无法加载时只能声明“只读查询仍可用”；不能声明 PVF 写入可用。工作台不会自动下载或安装 Microsoft DLL。
+- 可以声明完整中文等文字、同文件联动、准确计数和受控范围修改；不能宣传成任意中文、`.str`、StringLink 或高风险文件都能写。
+- 可以声明同一 PVF 内普通文本文件复制、路径受限的 titlebook 邮件文字，以及既有 NUT 的 ASCII 专用路线；必须同时说明各自的路径、证明和实机验证边界。
+- 可以声明已复查的独立 PVF 可在单独预览和确认后部署到测试客户端并恢复；不能把权限扩大到 NPK、IMG、UI 或其他客户端资源，也不能把部署成功宣传为实机通过。
+- 在 native Rust 源码和锁文件恢复前，不能声明该预编译后端可由本仓库完整复现。

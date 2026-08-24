@@ -21,13 +21,17 @@ const {
   buildVerifiedInlineTextPatch,
   buildVerifiedInlineTextBatchPatch,
   buildRawAsciiScriptPatch,
+  encodeLegacyText,
 } = require("./verified-inline-cn-text");
+const { buildBytePreservingAsciiTextPatch } = require("./byte-preserving-ascii-text");
 const {
   analyzeContextAnchoredReplacement,
   applyContextAnchoredReplacement,
   occurrenceMismatch,
 } = require("./context-anchored-replace");
 const {
+  EXISTING_NUT_CONTROLLED_MODE,
+  validateExistingNutTextTransition,
   validateRegistryLifecycleTransition,
   validateRegistryRowProof,
   parseRegistryRows,
@@ -344,6 +348,7 @@ function makeSearchQuery(args) {
 function commonReadOptions(args = {}) {
   return {
     pvfEncoding: args.pvfEncoding ? normalizeEncoding(args.pvfEncoding) : undefined,
+    rawContent: args.rawContent === true || args.rawSha256Only === true,
     decompileScript: args.decompileScript !== false,
     decompileBinaryAni: args.decompileBinaryAni !== false,
     autoConvertStringLink: Boolean(args.autoConvertStringLink),
@@ -357,6 +362,22 @@ async function readPvfFileWithSemanticGuard(sessionId, pvfPath, args = {}) {
   const normalizedPath = normalizePvfPath(pvfPath);
   const options = commonReadOptions(args);
   const session = getSessionState(sessionId);
+  const rawOverlay = options.rawContent === true ? getRawOverlay(sessionId, normalizedPath) : null;
+  if (rawOverlay) {
+    return {
+      file: {
+        fileName: normalizedPath,
+        dataLength: rawOverlay.length,
+        base64Content: rawOverlay.toString("base64"),
+      },
+      semanticReadGuard: {
+        applied: true,
+        reason: "controlled-write-raw-overlay",
+        backend: "native-session-overlay",
+        automatic: true,
+      },
+    };
+  }
   const overlay = getTextOverlay(sessionId, normalizedPath);
   if (overlay) {
     return {
@@ -793,16 +814,40 @@ async function toolSearch(args) {
 async function toolReadFile(args) {
   const sessionId = resolveSessionId(args);
   const pvfPath = normalizePvfPath(args.pvfPath);
+  const rawSha256Only = args.rawSha256Only === true;
   const readOptions = {
     pvfEncoding: args.pvfEncoding ? normalizeEncoding(args.pvfEncoding) : undefined,
-    decompileScript: args.decompileScript !== false,
-    decompileBinaryAni: args.decompileBinaryAni !== false,
+    rawContent: rawSha256Only,
+    decompileScript: rawSha256Only ? false : args.decompileScript !== false,
+    decompileBinaryAni: rawSha256Only ? false : args.decompileBinaryAni !== false,
     autoConvertStringLink: Boolean(args.autoConvertStringLink),
     useCompatibleDecompiler: args.useCompatibleDecompiler !== false,
     convertToSimplifiedChinese: args.convertToSimplifiedChinese !== false,
     semanticVerificationRead: args.semanticVerificationRead === true,
   };
   const { file, semanticReadGuard } = await readPvfFileWithSemanticGuard(sessionId, pvfPath, readOptions);
+  if (rawSha256Only) {
+    if (typeof file.base64Content !== "string") {
+      const error = new Error("Raw PVF content is unavailable for SHA256 readback.");
+      error.code = "RAW_CONTENT_READBACK_UNAVAILABLE";
+      throw error;
+    }
+    const rawBytes = Buffer.from(file.base64Content, "base64");
+    return text({
+      ok: true,
+      sessionId,
+      pvfPath,
+      metadata: {
+        fileName: file.fileName,
+        dataLength: file.dataLength,
+        isScriptFile: file.isScriptFile,
+        isBinaryAniFile: file.isBinaryAniFile,
+      },
+      rawContentBytes: rawBytes.length,
+      rawContentSha256: crypto.createHash("sha256").update(rawBytes).digest("hex"),
+      semanticReadGuard: semanticReadGuard || undefined,
+    });
+  }
   const content = typeof file.textContent === "string" ? sliceLines(file.textContent, args.startLine, args.endLine) : undefined;
   const limited = content === undefined ? {} : limitText(content, Number(args.maxChars ?? 30000));
   return text({
@@ -895,12 +940,23 @@ async function readRawPvfBytes(sessionId, pvfPath) {
     decompileScript: false,
     decompileBinaryAni: false,
   });
-  if (typeof file?.base64Content !== "string") {
-    const error = new Error(`PVF file did not return raw Base64 content: ${pvfPath}`);
-    error.code = "CN_TEXT_RAW_READ_FAILED";
-    throw error;
+  if (typeof file?.base64Content === "string") {
+    return Buffer.from(file.base64Content, "base64");
   }
-  return Buffer.from(file.base64Content, "base64");
+  if (semanticFallback) {
+    const fallbackSessionId = await ensureSemanticFallbackSession(sessionId);
+    const fallbackFile = await semanticFallback.readFile(fallbackSessionId, pvfPath, {
+      decompileScript: false,
+      decompileBinaryAni: false,
+      rawContent: true,
+    });
+    if (typeof fallbackFile?.base64Content === "string") {
+      return Buffer.from(fallbackFile.base64Content, "base64");
+    }
+  }
+  const error = new Error(`PVF file did not return raw Base64 content: ${pvfPath}`);
+  error.code = "CN_TEXT_RAW_READ_FAILED";
+  throw error;
 }
 
 async function writeVerifiedInlineText(sessionId, pvfPath, sourceText, args) {
@@ -1212,6 +1268,133 @@ async function toolApplyTextPlan(args) {
       semanticReadGuard: guardedRead.semanticReadGuard || undefined,
     });
   }
+  const existingNutAnalyses = analyses.filter((item) => item.change.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE);
+  let existingNutTransition = null;
+  if (existingNutAnalyses.length > 0) {
+    if (existingNutAnalyses.length !== analyses.length || !pvfPath.toLowerCase().endsWith(".nut")) {
+      const error = new Error("既有 NUT 专用路线只能包含同一个 .nut 的受控 ASCII 改动。");
+      error.code = "EXISTING_NUT_PLAN_SHAPE_INVALID";
+      throw error;
+    }
+    const proofJson = JSON.stringify(existingNutAnalyses[0].change.writeProof);
+    if (existingNutAnalyses.some((item) => JSON.stringify(item.change.writeProof) !== proofJson)) {
+      const error = new Error("同一个既有 NUT 的所有改动必须使用完全一致的 writeProof。");
+      error.code = "EXISTING_NUT_PROOF_MISMATCH";
+      throw error;
+    }
+    existingNutTransition = validateExistingNutTextTransition(
+      pvfPath,
+      guardedRead.file.textContent,
+      plannedText,
+      existingNutAnalyses[0].change.writeProof,
+      existingNutAnalyses.map((item) => item.change),
+    );
+    if (!existingNutTransition.ok) {
+      const error = new Error(`既有 NUT 文本迁移审计失败：${existingNutTransition.errors.join("；")}`);
+      error.code = "EXISTING_NUT_TRANSITION_AUDIT_FAILED";
+      error.details = existingNutTransition;
+      throw error;
+    }
+  }
+  if (existingNutTransition) {
+    const encoding = normalizeEncoding(readOptions.pvfEncoding || getSessionState(sessionId).encoding);
+    const sourceRawBytes = await readRawPvfBytes(sessionId, pvfPath);
+    const rawPatch = buildBytePreservingAsciiTextPatch({
+      sourceBytes: sourceRawBytes,
+      sourceText: guardedRead.file.textContent,
+      encoding,
+      changes: existingNutAnalyses.map((item) => ({
+        id: item.change.id,
+        previousText: item.change.previousText,
+        newText: item.change.newText,
+        contextBefore: item.change.contextBefore,
+        contextAfter: item.change.contextAfter,
+        scope: item.change.scope,
+        occurrenceIndex: item.change.occurrenceIndex,
+        replaceAll: item.change.replaceAll === true,
+        expectedOccurrences: item.expectedOccurrences,
+      })),
+    });
+    if (rawPatch.expectedText !== plannedText || rawPatch.steps.length !== analyses.length) {
+      const error = new Error("既有 NUT 的原始字节补丁计划与最终文本计划不一致。");
+      error.code = "EXISTING_NUT_RAW_PATCH_PLAN_MISMATCH";
+      error.details = {
+        expectedTextSha256: crypto.createHash("sha256").update(plannedText).digest("hex"),
+        rawPatchTextSha256: crypto.createHash("sha256").update(rawPatch.expectedText).digest("hex"),
+        expectedStepCount: analyses.length,
+        actualStepCount: rawPatch.steps.length,
+      };
+      throw error;
+    }
+    let originalRawBytesReencodedExactly = false;
+    try {
+      const reencoded = encoding === "Utf8"
+        ? Buffer.from(guardedRead.file.textContent, "utf8")
+        : encodeLegacyText(guardedRead.file.textContent, encoding);
+      originalRawBytesReencodedExactly = sourceRawBytes.equals(reencoded);
+    } catch {
+      // Old Cn/Tw/UTF-8 bytes may deliberately decode to U+FFFD.  The local
+      // ASCII patch does not need, and must not attempt, a whole-file rewrite.
+    }
+    const outputRawBytes = rawPatch.outputBytes;
+    const sourceRawSha256 = crypto.createHash("sha256").update(sourceRawBytes).digest("hex");
+    const outputRawSha256 = crypto.createHash("sha256").update(outputRawBytes).digest("hex");
+    let writeResult = null;
+    if (args.dryRun !== true) {
+      writeResult = await native.upsertFile(sessionId, pvfPath, { base64Content: outputRawBytes.toString("base64") });
+      setRawOverlay(sessionId, pvfPath, outputRawBytes);
+      setTextOverlay(sessionId, pvfPath, guardedRead.file, plannedText);
+    }
+    return text({
+      ok: true,
+      sessionId,
+      pvfPath,
+      changeCount: changes.length,
+      dryRun: args.dryRun === true,
+      finalTextSha256: crypto.createHash("sha256").update(plannedText).digest("hex"),
+      existingNutTransition,
+      results: analyses.map((item, index) => ({
+        id: item.change.id || null,
+        mode: EXISTING_NUT_CONTROLLED_MODE,
+        occurrenceCount: item.hits,
+        expectedOccurrences: item.expectedOccurrences,
+        contextAnchor: item.anchored.evidence,
+        encoding,
+        sourceRawSha256,
+        outputRawSha256,
+        sourceTextSha256: existingNutTransition.sourceTextSha256,
+        finalTextSha256: existingNutTransition.finalTextSha256,
+        originalRawBytesReencodedExactly,
+        rawBytePreservingPatch: rawPatch.proof.rawBytePreservingPatch,
+        wholeFileReencodingUsed: rawPatch.proof.wholeFileReencodingUsed,
+        sourceDecodedTextBound: rawPatch.proof.sourceDecodedTextBound,
+        nonTargetRawBytesPreserved: rawPatch.proof.nonTargetRawBytesPreserved,
+        sourceRawByteLength: rawPatch.proof.sourceRawByteLength,
+        outputRawByteLength: rawPatch.proof.outputRawByteLength,
+        sourceReplacementCharacterCount: rawPatch.proof.sourceReplacementCharacterCount,
+        outputReplacementCharacterCount: rawPatch.proof.outputReplacementCharacterCount,
+        replacementCharactersPreserved: rawPatch.proof.replacementCharactersPreserved,
+        bytePatchStepCount: rawPatch.proof.stepCount,
+        bytePatchStepsSha256: rawPatch.proof.stepProofsSha256,
+        stepSourceRawSha256: rawPatch.steps[index]?.sourceRawSha256 || null,
+        stepOutputRawSha256: rawPatch.steps[index]?.outputRawSha256 || null,
+        stepNonTargetRawBytesPreserved: rawPatch.steps[index]?.nonTargetRawBytesPreserved === true,
+        preservedRawByteCount: rawPatch.steps[index]?.preservedRawByteCount ?? null,
+        removedRawByteCount: rawPatch.steps[index]?.removedRawByteCount ?? null,
+        insertedRawByteCount: rawPatch.steps[index]?.insertedRawByteCount ?? null,
+        preservedRawBytesSha256: rawPatch.steps[index]?.preservedRawBytesSha256 || null,
+        unchangedRangesSha256: rawPatch.steps[index]?.unchangedRangesSha256 || null,
+        replacementRangesSha256: rawPatch.steps[index]?.replacementRangesSha256 || null,
+        existingStringEntriesPreserved: true,
+        stringTableUntouched: true,
+        appendedStringEntryCount: 0,
+        transitionAuditOk: true,
+        temporaryIndependentReadbackStillRequired: true,
+      })),
+      writeResult,
+      semanticReadGuard: guardedRead.semanticReadGuard || undefined,
+    });
+  }
   let rawScriptBytes = await readRawPvfBytes(sessionId, pvfPath);
   let stringTableBytes = await readRawPvfBytes(sessionId, "stringtable.bin");
   let rawSourceText = guardedRead.file.textContent;
@@ -1263,6 +1446,7 @@ async function toolApplyTextPlan(args) {
     dryRun: args.dryRun === true,
     finalTextSha256: crypto.createHash("sha256").update(plannedText).digest("hex"),
     results: proofs,
+    existingNutTransition: existingNutTransition || undefined,
     semanticReadGuard: guardedRead.semanticReadGuard || undefined,
   });
 }
@@ -1313,6 +1497,11 @@ async function toolReplaceText(args) {
   if (args.dryRun !== true) assertWritableBackend("PVF text replacement");
   const sessionId = resolveSessionId(args);
   const pvfPath = normalizePvfPath(args.pvfPath);
+  if (args.writeProof?.mode === EXISTING_NUT_CONTROLLED_MODE) {
+    const error = new Error("既有 NUT 修改必须使用同文件批处理，以便一次审计最终脚本；单条 pvf_replace_text 不可使用该模式。");
+    error.code = "EXISTING_NUT_BATCH_PLAN_REQUIRED";
+    throw error;
+  }
   if (typeof args.previousText !== "string" || typeof args.newText !== "string") {
     throw new Error("previousText and newText are required strings.");
   }
@@ -1475,12 +1664,13 @@ async function toolWriteFile(args) {
     throw new Error("textContent is required.");
   }
   const writeSafety = semanticWriteSafety({
-    kind: "write-file",
+    kind: args.samePvfCopyProof ? "copy-file" : "write-file",
     pvfPath,
     pvfEncoding: args.pvfEncoding,
     fallbackEncoding: getSessionState(sessionId).encoding,
     textContent: args.textContent,
     writeProof: args.writeProof,
+    samePvfCopyProof: args.samePvfCopyProof,
   });
   if (!writeSafety.allowed) {
     const error = new Error(`Controlled PVF write blocked: ${writeSafety.reason}`);
@@ -2022,6 +2212,7 @@ const tools = [
         useCompatibleDecompiler: { type: "boolean" },
         convertToSimplifiedChinese: { type: "boolean" },
         semanticVerificationRead: { type: "boolean" },
+        rawSha256Only: { type: "boolean" },
         startLine: { type: "integer", minimum: 1 },
         endLine: { type: "integer", minimum: 1 },
         maxChars: { type: "integer", minimum: 0 },
@@ -2195,6 +2386,15 @@ const tools = [
         compileBinaryAni: { type: "boolean" },
         convertToTraditionalChinese: { type: "boolean" },
         writeProof: { type: "object" },
+        samePvfCopyProof: {
+          type: "object",
+          properties: {
+            mode: { type: "string", enum: ["same-pvf-copy"] },
+            sourcePvfPath: { type: "string" },
+            sourceTextSha256: { type: "string" },
+          },
+          required: ["mode", "sourcePvfPath", "sourceTextSha256"],
+        },
       },
       required: ["pvfPath", "textContent"],
     },
@@ -2255,7 +2455,7 @@ async function handle(message) {
           capabilities: { tools: { listChanged: false } },
           serverInfo: {
             name: "pvf-workbench-bundled-backend",
-            version: "3.0.0",
+            version: "3.0.1",
             backend: selectedBackend.source,
             readOnly: effectiveReadOnly,
             capabilityMode: serverMode,

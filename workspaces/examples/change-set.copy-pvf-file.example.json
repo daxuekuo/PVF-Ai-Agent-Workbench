@@ -1,0 +1,28 @@
+{
+  "$schema": "../../core/pvf-agent-core/schemas/pvf-change-set.schema.json",
+  "schemaVersion": "1.0",
+  "mode": "dry-run-only",
+  "description": "第一轮只把目标 PVF 内的普通文本文件复制到一个不存在的同扩展名路径；需要调整克隆内容时，使用本轮成功的 APPLY-MANIFEST.json 开始累计第二轮。",
+  "target": {
+    "sourcePvf": "REPLACE_WITH_EXPLICIT_SOURCE_PVF",
+    "pvfOpenEncoding": "Tw",
+    "pvfReadEncoding": "Cn"
+  },
+  "changes": [
+    {
+      "id": "copy-difficulty-table",
+      "type": "copy-file",
+      "sourcePvfPath": "monster/monsterapcdifficultybonus.tbl",
+      "pvfPath": "dungeon/example/table/monsterapcdifficultybonus_custom.tbl",
+      "expectAbsent": true,
+      "pvfEncoding": "Cn",
+      "rationale": "复制目标 PVF 内已经能够正常读取的难度表，源文件和目标文件使用同一扩展名。"
+    }
+  ],
+  "safety": {
+    "writeModeEnabled": false,
+    "requiresBackupBeforeApply": true,
+    "requiresExplicitOutputPath": true,
+    "requiresReadback": true
+  }
+}

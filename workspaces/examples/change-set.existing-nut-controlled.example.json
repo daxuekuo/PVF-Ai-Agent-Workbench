@@ -1,0 +1,74 @@
+{
+  "$schema": "../../core/pvf-agent-core/schemas/pvf-change-set.schema.json",
+  "schemaVersion": "1.0",
+  "mode": "dry-run-only",
+  "description": "Existing NUT controlled ASCII edit shape only; replace every placeholder with target raw-read evidence.",
+  "target": {
+    "sourcePvf": "X:/replace-with-protected-source/Script.pvf",
+    "pvfOpenEncoding": "Cn",
+    "pvfReadEncoding": "Cn"
+  },
+  "changes": [
+    {
+      "id": "existing-nut-fixture-function",
+      "type": "replace-text",
+      "pvfPath": "sqr/character/job/appendage/ap_job_fixture.nut",
+      "previousText": "function fixture_proc(obj)\r\n{\r\n\treturn;\r\n}",
+      "newText": "function fixture_proc(obj)\r\n{\r\n\tCNSquirrelAppendage.sq_AddChangeStatusAppendageID(obj, obj, 120, CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL, false, 100, 9901);\r\n}",
+      "replaceAll": false,
+      "pvfEncoding": "Cn",
+      "rationale": "Illustrates the proof shape only; runtime values still require target-specific validation.",
+      "writeProof": {
+        "mode": "existing-nut-controlled-edit",
+        "sourceTextSha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "structureCheckRequired": true,
+        "temporaryRoundTripRequired": true,
+        "runtimeValidationRequired": true,
+        "loadChain": [
+          {
+            "fromPvfPath": "sqr/character/job_load_state.nut",
+            "toPvfPath": "sqr/character/job/passive_skill_job.nut",
+            "requiredText": "pushScriptFiles(\"character/job/passive_skill_job.nut\");"
+          },
+          {
+            "fromPvfPath": "sqr/character/job/passive_skill_job.nut",
+            "toPvfPath": "sqr/character/job/appendage/ap_job_fixture.nut",
+            "requiredText": "CNSquirrelAppendage.sq_AppendAppendage(obj, obj, -1, false, \"character/job/appendage/ap_job_fixture.nut\", true);"
+          }
+        ],
+        "touchedFunctions": [
+          "fixture_proc"
+        ],
+        "apiSymbols": [
+          {
+            "name": "sq_AddChangeStatusAppendageID",
+            "kind": "function",
+            "targetEvidencePaths": [
+              "sqr/target-version/existing-api-sample.nut"
+            ]
+          },
+          {
+            "name": "CHANGE_STATUS_TYPE_ACTIVESTATUS_TOLERANCE_ALL",
+            "kind": "constant",
+            "targetEvidencePaths": [
+              "sqr/target-version/existing-status-sample.nut"
+            ]
+          }
+        ],
+        "apidPlan": {
+          "namespace": "replace-with-task-purpose",
+          "ids": [
+            9901
+          ],
+          "conflictSearchRequired": true
+        }
+      }
+    }
+  ],
+  "safety": {
+    "writeModeEnabled": false,
+    "requiresBackupBeforeApply": true,
+    "requiresExplicitOutputPath": true,
+    "requiresReadback": true
+  }
+}

@@ -634,8 +634,8 @@
     },
     {
       "dest": "indexes/knowledge-index.json",
-      "bytes": 26126,
-      "sha256": "8cec7a77707ec40dcdc983cc2154a61e4038ca2dbf39a05b2b2f962e33e2ab4b"
+      "bytes": 26932,
+      "sha256": "a0915e9d71df46620b3acc1908bceeec3b9d805f752ae1740ab0ad62de2d8d2e"
     },
     {
       "dest": "indexes/knowledge-topic-routes.full.json",
@@ -964,13 +964,13 @@
     },
     {
       "dest": "safety/README.zh-CN.md",
-      "bytes": 12351,
-      "sha256": "0b214d21a22d5e50934929cace34a6622f8601696c9a4ad55fb7e0ffceac96b6"
+      "bytes": 15521,
+      "sha256": "2b6eaf293e0daec873c2eb66b0b80f6d070e0f9ab4882b60967145a4bfafe261"
     },
     {
       "dest": "task-cards/action-combat-cross-version-porting.zh-CN.md",
-      "bytes": 5364,
-      "sha256": "7780a46b16b5f04c2e65ffc276b8155f886b36fd84d34f44be87520835b36869"
+      "bytes": 5714,
+      "sha256": "5e2319c62460a9a4454f3647ece4cb7cdebb704496c93a1435ab7bffb1f45abe"
     },
     {
       "dest": "task-cards/actionobject-mapobject-breakable-spc-readonly-audit.zh-CN.md",
@@ -1178,9 +1178,14 @@
       "sha256": "d970c8d132bd2fd36a93f8fe7eea6f0a6375dad488055abd95278cb1d53a0948"
     },
     {
+      "dest": "task-cards/pvf-existing-nut-controlled-change.zh-CN.md",
+      "bytes": 5760,
+      "sha256": "c70ae03da289fcb2009c7a1cc8ab3aebf6c4bd93b673d883414ad3c2c15765ac"
+    },
+    {
       "dest": "task-cards/pvf-high-risk-new-file-controlled-change.zh-CN.md",
-      "bytes": 3752,
-      "sha256": "373f2e37e118aeddf28f8f708f9cd91db13cbcfa0e3d036302528bb292943e8a"
+      "bytes": 3885,
+      "sha256": "56205287261ba690c29c4d1871ae30e221bfd094d579c215dd619e3668d52ea9"
     },
     {
       "dest": "task-cards/pvf-package-quality-audit-readonly.zh-CN.md",
@@ -1191,6 +1196,11 @@
       "dest": "task-cards/pvf-registry-lst-topology-readonly-audit.zh-CN.md",
       "bytes": 3428,
       "sha256": "df628f6f83aa323a6ff69317d9ff420557dcb9e4a26cdc04a148a8e6d23f5536"
+    },
+    {
+      "dest": "task-cards/pvf-same-pvf-file-copy-controlled-change.zh-CN.md",
+      "bytes": 2513,
+      "sha256": "0b245988785e324ae34abf05b773a2146e12d4692032df442e3e32f60838c6fb"
     },
     {
       "dest": "task-cards/pvf-semantic-compare-workset-readonly.zh-CN.md",
@@ -1239,8 +1249,8 @@
     },
     {
       "dest": "task-cards/skill-state-nut-runtime-readonly-audit.zh-CN.md",
-      "bytes": 5228,
-      "sha256": "5534c1704ab7086177e4609ce83326122d0d33cb9b52185416c8d09302219bba"
+      "bytes": 5475,
+      "sha256": "29e5b8dfc4a02dbaeeb5477987a957a03cf73565e4fb3243b6a10c799838611b"
     },
     {
       "dest": "task-cards/skill-tree-layout-merge-readonly-plan.zh-CN.md",
@@ -1314,8 +1324,8 @@
     },
     {
       "dest": "workflows/client-pvf-controlled-deployment.zh-CN.md",
-      "bytes": 2217,
-      "sha256": "25a051c138f2b6e06ab992cc4bb51848e5b3ac559aff3415861ac3d6229c881e"
+      "bytes": 2410,
+      "sha256": "e3cf492b302d7cc19c13d4241e8ea2a7b57ccb681c38261114468a7996a2e769"
     },
     {
       "dest": "workflows/dungeon-difficulty-and-ultimate-list-audit.zh-CN.md",
@@ -1439,7 +1449,7 @@
     }
   ],
   "summary": {
-    "entryCount": 287,
-    "totalBytes": 5539285
+    "entryCount": 289,
+    "totalBytes": 5552457
   }
 }

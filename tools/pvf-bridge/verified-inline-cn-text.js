@@ -90,6 +90,9 @@ const ALLOWED_VISIBLE_TEXT_TAGS = new Set([
   "solve message",
   "speech on situation",
 ]);
+const PATH_SCOPED_VISIBLE_TEXT_TAGS = new Map([
+  ["send postal", new Set(["etc/titlebook.etc"])],
+]);
 
 const legacyEncodeMaps = new Map();
 
@@ -143,6 +146,35 @@ function immediateParentTag(sourceText, tokenOffset) {
     return normalizeTag(match[1]);
   }
   return null;
+}
+
+function nearestOpenTag(sourceText, tokenOffset) {
+  const lineStart = sourceText.lastIndexOf("\n", Math.max(0, tokenOffset - 1)) + 1;
+  const lines = sourceText.slice(0, lineStart).split(/\r?\n/);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const match = /^\[([^\]\r\n]+)\]$/.exec(lines[index].trim());
+    if (!match) continue;
+    if (match[1].trim().startsWith("/")) return null;
+    return normalizeTag(match[1]);
+  }
+  return null;
+}
+
+function normalizedPvfPath(value) {
+  return String(value || "").replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+}
+
+function visibleTextParentTag(sourceText, tokenOffset, pvfPath) {
+  const direct = immediateParentTag(sourceText, tokenOffset);
+  if (direct) return direct;
+  const nearest = nearestOpenTag(sourceText, tokenOffset);
+  const allowedPaths = PATH_SCOPED_VISIBLE_TEXT_TAGS.get(nearest);
+  return allowedPaths?.has(normalizedPvfPath(pvfPath)) ? nearest : null;
+}
+
+function visibleTextTagAllowed(parentTag, pvfPath) {
+  if (ALLOWED_VISIBLE_TEXT_TAGS.has(parentTag)) return true;
+  return PATH_SCOPED_VISIBLE_TEXT_TAGS.get(parentTag)?.has(normalizedPvfPath(pvfPath)) === true;
 }
 
 function isInsideStringLinkToken(sourceText, tokenOffset, tokenLength) {
@@ -311,12 +343,12 @@ function analyzeVerifiedInlineTextChange(input = {}) {
     if (isInsideStringLinkToken(sourceText, tokenOffset, previousText.length)) {
       throw codedError("STRINGLINK_TEXT_WRITE_UNVERIFIED", "StringLink 显示文本必须修改其真实字符串资源；当前仍保持只读。");
     }
-    const parentTag = immediateParentTag(sourceText, tokenOffset);
-    if (!parentTag || !ALLOWED_VISIBLE_TEXT_TAGS.has(parentTag)) {
+    const parentTag = visibleTextParentTag(sourceText, tokenOffset, pvfPath);
+    if (!parentTag || !visibleTextTagAllowed(parentTag, pvfPath)) {
       throw codedError(
         "CN_TEXT_PARENT_TAG_UNSUPPORTED",
         `当前只开放已确认的名称、说明和消息字段；目标字段 ${parentTag ? `[${parentTag}]` : "无法识别"} 未获允许。`,
-        { parentTag, occurrenceIndex: index },
+        { parentTag, extension, occurrenceIndex: index },
       );
     }
     occurrences.push({ offset: tokenOffset, parentTag });
@@ -469,13 +501,14 @@ function buildVerifiedInlineTextPatch(input = {}) {
   }
   const stringTable = StringTable.parse(stringTableBytes, analysis.encoding);
   const tokens = parseTokens(scriptBytes);
+  const extension = path.posix.extname(String(input.pvfPath || "").replace(/\\/g, "/").toLowerCase());
   const sourceAtoms = bindAtomsToRawTokens(lexDecompiledScript(String(input.sourceText || "")), tokens, stringTable);
   const requestedOffsets = new Set(analysis.occurrenceOffsets);
   const candidates = sourceAtoms
     .filter((atom) => requestedOffsets.has(atom.start))
     .map((atom) => {
       const rawToken = atom.rawTokens?.[0];
-      const parentTag = immediateParentTag(String(input.sourceText || ""), atom.start);
+      const parentTag = visibleTextParentTag(String(input.sourceText || ""), atom.start, input.pvfPath);
       if (
         atom.kind !== "string" ||
         atom.value !== analysis.previousValue ||
@@ -633,6 +666,7 @@ function buildVerifiedInlineTextBatchPatch(input = {}) {
   }
 
   const pvfPath = String(input.pvfPath || "").replace(/\\/g, "/");
+  const extension = path.posix.extname(pvfPath.toLowerCase());
   const encoding = normalizeEncoding(input.pvfEncoding, input.fallbackEncoding || "Tw");
   const originalStringEntries = parseStringTableEntries(input.stringTableBytes);
   const originalStringEntriesSha256 = entrySequenceSha256(originalStringEntries);
@@ -722,7 +756,7 @@ function buildVerifiedInlineTextBatchPatch(input = {}) {
       .filter((atom) => requestedOffsets.has(atom.start))
       .map((atom) => {
         const rawToken = atom.rawTokens?.[0];
-        const parentTag = immediateParentTag(String(input.sourceText || ""), atom.start);
+        const parentTag = visibleTextParentTag(String(input.sourceText || ""), atom.start, pvfPath);
         if (
           atom.kind !== "string" ||
           atom.value !== analysis.previousValue ||
@@ -1379,6 +1413,53 @@ function verifiedInlineTextSelfTest() {
       twPatch.proof.encoding === "Tw" &&
       twPatch.proof.existingStringEntriesPreserved === true &&
       twOutputTable.get(1) === "將任意裝備強化至+20以上一次。",
+  });
+
+  const postalSourceText = [
+    "#PVF_File",
+    "[send postal]",
+    "2660296\t1",
+    "`Title Book Reward`",
+    "`Congratulations!`",
+    "`The reward is sent to your mailbox.`",
+    "[name]",
+    "`稱號簿特殊成就獎勵`",
+    "",
+  ].join("\r\n");
+  const postalAnalysis = analyzeVerifiedInlineTextChange({
+    textWriteMode: VERIFIED_INLINE_TEXT_MODE,
+    pvfPath: "etc/titlebook.etc",
+    pvfEncoding: "Tw",
+    sourceText: postalSourceText,
+    previousText: "`Title Book Reward`",
+    newText: "`稱號簿鎮魂試煉獎勵`",
+    replaceAll: false,
+  });
+  checks.push({
+    id: "big5-etc-send-postal-complete-text-accepted",
+    ok:
+      postalAnalysis.allowed === true &&
+      postalAnalysis.parentTag === "send postal" &&
+      postalAnalysis.occurrenceCount === 1 &&
+      postalAnalysis.requiresEncodingRoundTripProbe === true,
+  });
+
+  let postalOutsideEtcCode = null;
+  try {
+    analyzeVerifiedInlineTextChange({
+      textWriteMode: VERIFIED_INLINE_TEXT_MODE,
+      pvfPath: "etc/other-postal.etc",
+      pvfEncoding: "Tw",
+      sourceText: postalSourceText,
+      previousText: "`Title Book Reward`",
+      newText: "`稱號簿鎮魂試煉獎勵`",
+      replaceAll: false,
+    });
+  } catch (error) { postalOutsideEtcCode = error.code; }
+  checks.push({
+    id: "send-postal-outside-etc-remains-blocked",
+    ok: postalOutsideEtcCode === "CN_TEXT_PARENT_TAG_UNSUPPORTED",
+    code: postalOutsideEtcCode,
   });
 
   for (const fixture of [

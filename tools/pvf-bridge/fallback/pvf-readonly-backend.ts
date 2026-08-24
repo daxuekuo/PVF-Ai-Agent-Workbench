@@ -34,6 +34,7 @@ type ReadFileOptions = Readonly<{
   decompileScript?: boolean;
   decompileBinaryAni?: boolean;
   autoConvertStringLink?: boolean;
+  rawContent?: boolean;
 }>;
 
 type SearchQuery = Readonly<Record<string, any>>;
@@ -357,7 +358,9 @@ async function readFile(sessionId: string, fileName: string, options: ReadFileOp
     backend: "typescript-readonly-fallback",
   };
 
-  if (entry.isScriptFile && options.decompileScript !== false) {
+  if (options.rawContent === true) {
+    result.base64Content = bytes.toString("base64");
+  } else if (entry.isScriptFile && options.decompileScript !== false) {
     const table = await session.ensureStringTable(options.pvfEncoding || session.encoding);
     let text = entry.fileName.endsWith(".lst") ? decompileLst(bytes, table) : null;
     if (text === null) {

@@ -882,11 +882,32 @@ function checkWritePolicy(writePolicy, errors) {
     semanticSafety.stringLinkTextWriteAllowed !== false ||
     semanticSafety.cnAndTwRoundTripProbeRequired !== true ||
     semanticSafety.numericOrAsciiMinimalWriteAllowed !== true ||
+    semanticSafety.samePvfOrdinaryTextCopyAllowed !== true ||
+    semanticSafety.samePvfCopyRequiresSameExtension !== true ||
+    semanticSafety.samePvfCopyRequiresAbsentTarget !== true ||
+    semanticSafety.samePvfCopyHighRiskExtensionsAllowed !== false ||
+    semanticSafety.samePvfCopyRoundTripProbeRequired !== true ||
+    semanticSafety.samePvfCopyModificationRequiresCumulativeNextRound !== true ||
     semanticSafety.highRiskNewFileProofRequired !== true ||
     semanticSafety.highRiskNewFileRoundTripProbeRequired !== true ||
     semanticSafety.highRiskFinalIndependentReadbackRequired !== true ||
     semanticSafety.highRiskSameExtensionReferenceRequired !== true ||
     semanticSafety.existingHighRiskFileProtectionRemains !== true ||
+    semanticSafety.existingNutControlledEditRequiresDedicatedProof !== true ||
+    semanticSafety.existingNutAsciiOnly !== true ||
+    semanticSafety.existingNutSourceTextSha256Required !== true ||
+    semanticSafety.existingNutRawBytePreservingPatchRequired !== true ||
+    semanticSafety.existingNutWholeFileReencodingAllowed !== false ||
+    semanticSafety.existingNutNonTargetRawBytesMustRemainIdentical !== true ||
+    semanticSafety.existingNutLoadChainRequired !== true ||
+    semanticSafety.existingNutFunctionApiAndApidAuditRequired !== true ||
+    semanticSafety.existingNutEvidenceMustBeExecutableCode !== true ||
+    semanticSafety.existingNutApidMustBeExactIntegerLiteral !== true ||
+    semanticSafety.existingNutApidMustBeDeclaredApiCallArgument !== true ||
+    semanticSafety.existingNutTemporaryRoundTripRequired !== true ||
+    semanticSafety.existingNutFinalIndependentReadbackRequired !== true ||
+    semanticSafety.existingNutRuntimeValidationRequired !== true ||
+    semanticSafety.existingCoSqrStrProtectionRemains !== true ||
     semanticSafety.registryLifecycleOnlyForExplicitRowAdd !== true ||
     semanticSafety.registryLifecycleExistingTextPreserved !== true ||
     semanticSafety.registryLifecycleTargetClosureRequired !== true ||
@@ -903,7 +924,7 @@ function checkWritePolicy(writePolicy, errors) {
     errors.push("write-policy.json must require a content-addressed source backup and recheck its SHA256 before reuse.");
   }
   const runnerTools = new Set(writePolicy.controlledWriteRunner?.allowedBridgeTools || []);
-  for (const tool of ["pvf_open", "pvf_read_file", "pvf_replace_text", "pvf_apply_text_plan", "pvf_apply_verified_text_plan", "pvf_save", "pvf_close"]) {
+  for (const tool of ["pvf_open", "pvf_search", "pvf_read_file", "pvf_replace_text", "pvf_apply_text_plan", "pvf_apply_verified_text_plan", "pvf_save", "pvf_close"]) {
     if (!runnerTools.has(tool)) {
       errors.push(`write-policy.json controlledWriteRunner.allowedBridgeTools missing: ${tool}`);
     }
@@ -918,7 +939,7 @@ function checkWritePolicy(writePolicy, errors) {
     errors.push("write-policy.json must require verification of every declared cumulative baseline chain.");
   }
   const allowed = new Set(writePolicy.allowedOperations || []);
-  for (const operation of ["dry-run-verified-inline-text", "apply-verified-inline-text-to-explicit-output"]) {
+  for (const operation of ["dry-run-verified-inline-text", "apply-verified-inline-text-to-explicit-output", "dry-run-copy-same-pvf-file", "apply-copy-same-pvf-file-to-explicit-output", "dry-run-existing-nut-controlled-edit", "apply-existing-nut-controlled-edit-to-explicit-output"]) {
     if (!allowed.has(operation)) {
       errors.push(`write-policy.json must explicitly allow the controlled operation: ${operation}`);
     }
@@ -953,6 +974,7 @@ function checkClientPvfDeployPolicy(policy, errors) {
     permission.profileClientRootRequired !== true ||
     permission.directClientPathAllowed !== false ||
     permission.sourcePvfOverwriteAllowed !== false ||
+    permission.clientOriginSourcePromotionAllowed !== true ||
     permission.applyOutputMutationAllowed !== false ||
     permission.nonPvfClientResourceWriteAllowed !== false
   ) {
@@ -967,6 +989,7 @@ function checkClientPvfDeployPolicy(policy, errors) {
     "profile-client-target",
     "current-client-pvf-sha256-binding",
     "current-client-matches-apply-input-or-explicit-baseline-switch",
+    "verified-protected-source-anchor-before-client-origin-replacement",
     "explicit-deploy-authorization-code",
     "client-and-launcher-confirmed-closed",
     "content-addressed-client-backup",
@@ -994,7 +1017,7 @@ function checkClientPvfDeployPolicy(policy, errors) {
     "deploy-changed-source-pvf",
     "deploy-stale-client-target",
     "deploy-over-divergent-baseline-without-explicit-switch",
-    "deploy-over-source-pvf",
+    "deploy-over-unanchored-source-pvf",
     "deploy-to-direct-unprofiled-path",
     "overwrite-client-without-backup",
     "rollback-without-preview",
